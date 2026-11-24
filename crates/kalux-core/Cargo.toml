@@ -1,0 +1,10 @@
+[package]
+name = "kalux-core"
+description = "Platform-independent model for Kalux: image types, playlist, natural sort, view math, cache, actions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
