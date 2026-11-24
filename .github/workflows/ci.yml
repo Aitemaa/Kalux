@@ -58,11 +58,11 @@ jobs:
           $v = Start-Process $exe -ArgumentList "--version" -Wait -PassThru
           if ($v.ExitCode -ne 0) { throw "--version exited $($v.ExitCode)" }
           New-Item -ItemType Directory -Force bench-out | Out-Null
-          & $exe --gen-test-image bench-out/test-12mp.jpg 4000 3000
-          if ($LASTEXITCODE -ne 0) { throw "--gen-test-image failed" }
+          $g = Start-Process $exe -ArgumentList "--gen-test-image", "bench-out/test-12mp.jpg", "4000", "3000" -Wait -PassThru -NoNewWindow
+          if ($g.ExitCode -ne 0) { throw "--gen-test-image exited $($g.ExitCode)" }
           for ($i = 0; $i -lt 5; $i++) {
             & $exe --bench-startup bench-out/test-12mp.jpg | Tee-Object -Append bench-out/startup.jsonl
-            if ($LASTEXITCODE -ne 0) { throw "--bench-startup failed" }
+            if ($LASTEXITCODE -ne 0) { throw "--bench-startup failed ($LASTEXITCODE)" }
           }
           "### Startup bench (5 runs)`n``````" | Out-File -Append $env:GITHUB_STEP_SUMMARY
           Get-Content bench-out/startup.jsonl | Out-File -Append $env:GITHUB_STEP_SUMMARY

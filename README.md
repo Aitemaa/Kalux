@@ -25,7 +25,8 @@ Measured numbers will replace the estimates once M0 (baseline) is done. See [doc
 ```powershell
 cargo build --release -p kalux-app   # → target\release\kalux.exe
 kalux.exe path\to\photo.jpg
-kalux.exe --bench-startup path\to\photo.jpg   # prints startup timings as JSON
+kalux.exe --bench-startup path\to\photo.jpg   # prints startup timings as JSON (optional --bench-out <path>)
+kalux.exe --gen-test-image test.jpg 4000 3000 # generates a deterministic 12 MP test JPEG via WIC
 ```
 
 ## Keys
@@ -35,9 +36,10 @@ kalux.exe --bench-startup path\to\photo.jpg   # prints startup timings as JSON
 | Home / End | First / last in folder |
 | Wheel, `+` `-` | Zoom |
 | `0` / `1` | Fit / 100% |
+| Left-drag | Pan when zoomed |
 | F11, double-click | Fullscreen |
 | `?` | All shortcuts |
-| Esc | Exit fullscreen, then close |
+| Esc / Ctrl+W | Exit fullscreen, then close |
 
 ## License
 MIT
