@@ -44,5 +44,13 @@ windows = { workspace = true, features = [
 ] }
 windows-numerics.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ab_glyph.workspace = true
+jpeg-encoder.workspace = true
+png.workspace = true
+rustix.workspace = true
+wayrs-client.workspace = true
+wayrs-protocols.workspace = true
+
 [build-dependencies]
 embed-manifest.workspace = true

@@ -15,11 +15,20 @@ kalux-core = { path = "crates/kalux-core" }
 kalux-decode = { path = "crates/kalux-decode" }
 windows = "0.62"
 windows-numerics = "0.3"
-zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+zune-jpeg = "0.5"
 zune-core = "0.5"
 kamadak-exif = "0.6"
 crossbeam-channel = "0.5"
 embed-manifest = "1.5"
+png = "0.18"
+gif = "0.13"
+image-webp = "0.2"
+image = { version = "0.25", default-features = false, features = ["bmp", "ico", "tiff"] }
+jpeg-encoder = "0.6"
+ab_glyph = "0.2"
+wayrs-client = "1"
+wayrs-protocols = { version = "0.14", features = ["xdg-shell", "xdg-decoration-unstable-v1", "fractional-scale-v1", "viewporter", "cursor-shape-v1"] }
+rustix = { version = "1", features = ["fs", "mm", "event", "pipe", "process"] }
 
 [profile.release]
 opt-level = 3

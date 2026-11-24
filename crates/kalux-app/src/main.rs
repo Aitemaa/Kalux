@@ -1,7 +1,10 @@
-//! kalux.exe — native Windows image viewer (see docs/PRD.md §7.1 and §9).
+//! kalux — instant native image viewer for Windows (Win32 + Direct2D) and Linux (Wayland / Niri).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod args;
+
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(windows)]
 mod bench;
@@ -18,14 +21,23 @@ mod testimg;
 #[cfg(windows)]
 mod window;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn main() {
+    let main_start = std::time::Instant::now();
+    let exit_code = linux::run_linux(main_start);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn main() {
     match args::parse_args(std::env::args_os().skip(1)) {
         Ok(args::Command::Version) => {
             println!("kalux {}", env!("CARGO_PKG_VERSION"));
         }
         _ => {
-            eprintln!("kalux is a native Windows image viewer and is not supported on this OS.");
+            eprintln!("kalux supports Windows (Win32 + Direct2D) and Linux (Wayland).");
         }
     }
 }

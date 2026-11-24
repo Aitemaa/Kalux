@@ -19,6 +19,8 @@
 mod anim;
 mod jpeg;
 mod orient;
+#[cfg(not(windows))]
+mod portable;
 mod scale;
 mod store;
 #[cfg(windows)]
@@ -29,8 +31,6 @@ use std::io::Read;
 use std::path::Path;
 
 use kalux_core::DecodedImage;
-#[cfg(not(windows))]
-use kalux_core::ImageFormat;
 
 pub use store::{ImageStore, StoreConfig, StoreEvent};
 
@@ -144,10 +144,6 @@ pub fn decode_file(path: &Path, max_size: Option<(u32, u32)>) -> Result<DecodedI
         if is_jpeg {
             return jpeg::decode_jpeg_file(path, max_size);
         }
-        // If the file has a JPEG extension but invalid magic bytes, report Corrupt instead of Unsupported.
-        if ImageFormat::from_path(path) == Some(ImageFormat::Jpeg) {
-            return Err(DecodeError::Corrupt("invalid JPEG header".into()));
-        }
-        Err(DecodeError::Unsupported { hint: None })
+        portable::decode_file_portable(path, &header[..n], max_size)
     }
 }

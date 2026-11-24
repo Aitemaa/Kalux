@@ -90,12 +90,67 @@ jobs:
             screenshots-out/*.png
           if-no-files-found: ignore
 
-  linux-core:
+  linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Test platform-independent crates
-        run: cargo test -p kalux-core -p kalux-decode
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Pure-Rust dependency check (no cc / cmake / pkg-config / wayland-sys)
+        run: |
+          tree=$(cargo tree --workspace -e normal,build --prefix none --format '{p}')
+          bad=$(echo "$tree" | grep -E '^(cc|cmake|pkg-config|wayland-sys|webview2|wry|tauri|winit|wgpu) ' || true)
+          if [ -n "$bad" ]; then echo "::error::Forbidden dependencies: $bad"; exit 1; fi
+          echo "OK: $(echo "$tree" | sort -u | wc -l) crates, all pure Rust"
+
+      - name: Build release
+        run: cargo build --release -p kalux-app
+
+      - name: Binary size & dynamic library gate
+        run: |
+          size=$(stat -c %s target/release/kalux)
+          echo "kalux (linux): $size bytes ($(awk "BEGIN{printf \"%.2f\", $size/1048576}") MiB)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt "$SIZE_HARD_CAP" ]; then echo "::error::kalux exceeds the 8 MiB hard cap"; exit 1; fi
+          if [ "$size" -gt "$SIZE_WARN" ]; then echo "::warning::kalux is above the 4 MiB target"; fi
+          libs=$(ldd target/release/kalux)
+          echo "$libs"
+          if echo "$libs" | grep -Ei 'libwayland|libX11|libgtk|libQt|libfontconfig'; then
+            echo "::error::Unexpected GUI shared library dependency"; exit 1
+          fi
+
+      - name: CLI & offscreen screenshot smoke test
+        run: |
+          mkdir -p bench-out screenshots-out
+          ./target/release/kalux --version
+          ./target/release/kalux --gen-test-image bench-out/test-12mp.jpg 4000 3000
+          ./target/release/kalux --screenshot assets/demo-photo.jpg screenshots-out/linux-dark.png \
+            --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux" \
+            --toast "100% · Fit"
+          ./target/release/kalux --screenshot assets/demo-photo.jpg screenshots-out/linux-light.png \
+            --light --help \
+            --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux"
+          ls -lh bench-out/ screenshots-out/
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: kalux-linux-x64
+          path: |
+            target/release/kalux
+            packaging/linux/kalux.desktop
+            packaging/linux/install.sh
+            screenshots-out/*.png
+          if-no-files-found: ignore

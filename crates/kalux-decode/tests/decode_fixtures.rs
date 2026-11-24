@@ -110,20 +110,9 @@ fn missing_file_and_display_errors() {
     assert!(hint_err.to_string().contains("HEIF Image Extensions"));
 }
 
-#[cfg(not(windows))]
 #[test]
-fn non_jpeg_returns_unsupported_without_hint_on_linux() {
-    let err = decode_file(&fixture("alpha.png"), None).unwrap_err();
-    assert!(matches!(err, DecodeError::Unsupported { hint: None }));
-
-    let err_gif = decode_file(&fixture("animated.gif"), None).unwrap_err();
-    assert!(matches!(err_gif, DecodeError::Unsupported { hint: None }));
-}
-
-#[cfg(windows)]
-#[test]
-fn wic_decodes_png_with_premultiplied_alpha() {
-    let img = decode_file(&fixture("alpha.png"), None).expect("WIC PNG decode should succeed");
+fn decodes_png_with_premultiplied_alpha() {
+    let img = decode_file(&fixture("alpha.png"), None).expect("PNG decode should succeed");
     assert_eq!(img.format, ImageFormat::Png);
     assert_eq!((img.width, img.height), (16, 16));
     assert!(!img.is_animated());
@@ -143,10 +132,9 @@ fn wic_decodes_png_with_premultiplied_alpha() {
     assert_eq!(right, [0, 0, 0, 0]);
 }
 
-#[cfg(windows)]
 #[test]
-fn wic_decodes_animated_gif_with_disposal_and_delays() {
-    let img = decode_file(&fixture("animated.gif"), None).expect("WIC GIF decode should succeed");
+fn decodes_animated_gif_with_disposal_and_delays() {
+    let img = decode_file(&fixture("animated.gif"), None).expect("GIF decode should succeed");
     assert_eq!(img.format, ImageFormat::Gif);
     assert_eq!((img.width, img.height), (16, 16));
     assert!(img.is_animated());

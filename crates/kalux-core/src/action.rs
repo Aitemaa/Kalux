@@ -96,6 +96,67 @@ pub fn action_for_key(vk: u16, mods: Modifiers) -> Option<Action> {
     }
 }
 
+/// Map a Linux evdev keycode (`linux/input-event-codes.h`, i.e. Wayland `wl_keyboard::key` raw
+/// keycode) + modifiers to a Kalux [`Action`].
+pub fn action_for_linux_evdev(keycode: u32, mods: Modifiers) -> Option<Action> {
+    if mods.alt {
+        return None;
+    }
+
+    // Standard Linux evdev keycodes (input-event-codes.h).
+    const KEY_ESC: u32 = 1;
+    const KEY_1: u32 = 2;
+    const KEY_0: u32 = 11;
+    const KEY_MINUS: u32 = 12;
+    const KEY_EQUAL: u32 = 13;
+    const KEY_W: u32 = 17;
+    const KEY_E: u32 = 18;
+    const KEY_R: u32 = 19;
+    const KEY_I: u32 = 23;
+    const KEY_C: u32 = 46;
+    const KEY_SLASH: u32 = 53;
+    const KEY_KPMINUS: u32 = 74;
+    const KEY_KPPLUS: u32 = 78;
+    const KEY_KP1: u32 = 79;
+    const KEY_KP0: u32 = 82;
+    const KEY_F11: u32 = 87;
+    const KEY_HOME: u32 = 102;
+    const KEY_PAGEUP: u32 = 104;
+    const KEY_LEFT: u32 = 105;
+    const KEY_RIGHT: u32 = 106;
+    const KEY_END: u32 = 107;
+    const KEY_PAGEDOWN: u32 = 109;
+    const KEY_DELETE: u32 = 111;
+
+    match (keycode, mods.ctrl, mods.shift) {
+        (KEY_RIGHT | KEY_PAGEDOWN, false, false) => Some(Action::Next),
+        (KEY_LEFT | KEY_PAGEUP, false, false) => Some(Action::Prev),
+        (KEY_HOME, false, false) => Some(Action::First),
+        (KEY_END, false, false) => Some(Action::Last),
+
+        (KEY_EQUAL, _, _) => Some(Action::ZoomIn),
+        (KEY_KPPLUS, _, false) => Some(Action::ZoomIn),
+        (KEY_MINUS | KEY_KPMINUS, _, false) => Some(Action::ZoomOut),
+        (KEY_0 | KEY_KP0, _, false) => Some(Action::ZoomFit),
+        (KEY_1 | KEY_KP1, _, false) => Some(Action::ZoomActual),
+
+        (KEY_F11, false, false) => Some(Action::ToggleFullscreen),
+        (KEY_ESC, false, false) => Some(Action::Escape),
+        (KEY_W, true, false) => Some(Action::Close),
+        (KEY_SLASH, false, true) => Some(Action::ShowHelp),
+
+        (KEY_R, false, false) => Some(Action::RotateCw),
+        (KEY_R, false, true) => Some(Action::RotateCcw),
+        (KEY_I, false, false) => Some(Action::ToggleInfo),
+        (KEY_DELETE, false, false) => Some(Action::Delete),
+        (KEY_C, true, false) => Some(Action::CopyImage),
+        (KEY_C, true, true) => Some(Action::CopyPath),
+        (KEY_E, false, false) => Some(Action::EditInKapix),
+
+        _ => None,
+    }
+}
+
 const HELP_ROWS: &[(&str, &str)] = &[
     ("← / → / PgUp / PgDn", "Previous / next image"),
     ("Home / End", "First / last in folder"),
@@ -197,5 +258,26 @@ mod tests {
             assert!(!key.is_empty());
             assert!(!desc.is_empty());
         }
+    }
+
+    #[test]
+    fn linux_evdev_keys() {
+        assert_eq!(action_for_linux_evdev(106, NONE), Some(Action::Next));
+        assert_eq!(action_for_linux_evdev(105, NONE), Some(Action::Prev));
+        assert_eq!(action_for_linux_evdev(102, NONE), Some(Action::First));
+        assert_eq!(action_for_linux_evdev(107, NONE), Some(Action::Last));
+        assert_eq!(action_for_linux_evdev(13, SHIFT), Some(Action::ZoomIn));
+        assert_eq!(action_for_linux_evdev(12, NONE), Some(Action::ZoomOut));
+        assert_eq!(action_for_linux_evdev(11, NONE), Some(Action::ZoomFit));
+        assert_eq!(action_for_linux_evdev(2, NONE), Some(Action::ZoomActual));
+        assert_eq!(
+            action_for_linux_evdev(87, NONE),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(action_for_linux_evdev(1, NONE), Some(Action::Escape));
+        assert_eq!(action_for_linux_evdev(17, CTRL), Some(Action::Close));
+        assert_eq!(action_for_linux_evdev(53, SHIFT), Some(Action::ShowHelp));
+        assert_eq!(action_for_linux_evdev(53, NONE), None);
+        assert_eq!(action_for_linux_evdev(106, ALT), None);
     }
 }

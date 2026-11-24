@@ -15,24 +15,29 @@ pub fn fit_dimensions(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u
     (dst_w, dst_h)
 }
 
+const FP_SHIFT: u32 = 22;
+const FP_SCALE: u64 = 1 << FP_SHIFT;
+const FP_HALF: u32 = 1 << (FP_SHIFT - 1);
+
 #[derive(Copy, Clone)]
 struct Span {
     start: usize,
     /// Exclusive end index.
     end: usize,
-    first_weight: u64,
-    last_weight: u64,
+    first_weight: u32,
+    last_weight: u32,
 }
 
-/// Precompute exact integer area-overlap spans mapping `src_len` pixels down to `dst_len` pixels.
+/// Precompute fixed-point (`1 << 22`) area-overlap spans mapping `src_len` pixels down to `dst_len`.
 ///
-/// In units of `1 / dst_len`, output pixel `d` covers `[d * src_len, (d + 1) * src_len]`
-/// (total weight `src_len`). Each source pixel `s` covers `[s * dst_len, (s + 1) * dst_len]`.
-/// Interior pixels have exact weight `dst_len`; boundary pixels have `first_weight` / `last_weight`.
-fn build_spans(src_len: usize, dst_len: usize) -> Vec<Span> {
+/// Every span's weights sum to exactly `1 << 22`, guaranteeing exact preservation of solid colors
+/// while allowing the inner resampling loops to use `u32` accumulation and a bitshift instead of
+/// 64-bit integer division.
+fn build_spans(src_len: usize, dst_len: usize) -> (Vec<Span>, u32) {
     let mut spans = Vec::with_capacity(dst_len);
     let s_u64 = src_len as u64;
     let d_u64 = dst_len as u64;
+    let mid_weight = ((d_u64 * FP_SCALE) / s_u64) as u32;
 
     for d in 0..dst_len {
         let out_start = (d as u64) * s_u64;
@@ -41,24 +46,39 @@ fn build_spans(src_len: usize, dst_len: usize) -> Vec<Span> {
         let start = (out_start / d_u64) as usize;
         let end = (out_end.div_ceil(d_u64) as usize).min(src_len);
 
-        let first_src_end = ((start as u64) + 1) * d_u64;
-        let first_weight = first_src_end.min(out_end) - out_start;
+        if end <= start + 1 {
+            spans.push(Span {
+                start,
+                end,
+                first_weight: FP_SCALE as u32,
+                last_weight: 0,
+            });
+            continue;
+        }
 
-        let last_weight = if end <= start + 1 {
-            0
-        } else {
-            let last_src_start = ((end - 1) as u64) * d_u64;
-            out_end - last_src_start
-        };
+        let first_src_end = ((start as u64) + 1) * d_u64;
+        let first_raw = first_src_end.min(out_end) - out_start;
+        let last_src_start = ((end - 1) as u64) * d_u64;
+        let last_raw = out_end - last_src_start;
+
+        let mut first_w = (first_raw * FP_SCALE) / s_u64;
+        let mut last_w = (last_raw * FP_SCALE) / s_u64;
+        let n_mid = (end - start - 2) as u64;
+        let sum = first_w + n_mid * u64::from(mid_weight) + last_w;
+        if let Some(rem) = FP_SCALE.checked_sub(sum) {
+            let add_first = rem / 2;
+            first_w += add_first;
+            last_w += rem - add_first;
+        }
 
         spans.push(Span {
             start,
             end,
-            first_weight,
-            last_weight,
+            first_weight: first_w as u32,
+            last_weight: last_w as u32,
         });
     }
-    spans
+    (spans, mid_weight)
 }
 
 /// Downscale a tightly-packed BGRA8 premultiplied image from `(src_w, src_h)` to `(dst_w, dst_h)`
@@ -84,10 +104,7 @@ pub fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
     let horiz: Vec<u8> = if dw == sw {
         src.to_vec()
     } else {
-        let spans = build_spans(sw, dw);
-        let mid_w = dw as u64;
-        let denom = sw as u64;
-        let half = denom / 2;
+        let (spans, mid_w) = build_spans(sw, dw);
         let mut tmp = vec![0u8; dw * sh * 4];
 
         for y in 0..sh {
@@ -95,40 +112,44 @@ pub fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
             let drow = &mut tmp[y * dw * 4..(y + 1) * dw * 4];
             for (dx, span) in spans.iter().enumerate() {
                 let s0 = span.start * 4;
-                let mut acc0 = srow[s0] as u64 * span.first_weight;
-                let mut acc1 = srow[s0 + 1] as u64 * span.first_weight;
-                let mut acc2 = srow[s0 + 2] as u64 * span.first_weight;
-                let mut acc3 = srow[s0 + 3] as u64 * span.first_weight;
+                let fw = span.first_weight;
+                let mut acc0 = u32::from(srow[s0]) * fw;
+                let mut acc1 = u32::from(srow[s0 + 1]) * fw;
+                let mut acc2 = u32::from(srow[s0 + 2]) * fw;
+                let mut acc3 = u32::from(srow[s0 + 3]) * fw;
 
                 if span.end > span.start + 1 {
-                    let mut m0 = 0u64;
-                    let mut m1 = 0u64;
-                    let mut m2 = 0u64;
-                    let mut m3 = 0u64;
-                    for sx in (span.start + 1)..(span.end - 1) {
-                        let o = sx * 4;
-                        m0 += srow[o] as u64;
-                        m1 += srow[o + 1] as u64;
-                        m2 += srow[o + 2] as u64;
-                        m3 += srow[o + 3] as u64;
+                    if span.end > span.start + 2 {
+                        let mut m0 = 0u32;
+                        let mut m1 = 0u32;
+                        let mut m2 = 0u32;
+                        let mut m3 = 0u32;
+                        for sx in (span.start + 1)..(span.end - 1) {
+                            let o = sx * 4;
+                            m0 += u32::from(srow[o]);
+                            m1 += u32::from(srow[o + 1]);
+                            m2 += u32::from(srow[o + 2]);
+                            m3 += u32::from(srow[o + 3]);
+                        }
+                        acc0 += m0 * mid_w;
+                        acc1 += m1 * mid_w;
+                        acc2 += m2 * mid_w;
+                        acc3 += m3 * mid_w;
                     }
-                    acc0 += m0 * mid_w;
-                    acc1 += m1 * mid_w;
-                    acc2 += m2 * mid_w;
-                    acc3 += m3 * mid_w;
 
                     let sl = (span.end - 1) * 4;
-                    acc0 += srow[sl] as u64 * span.last_weight;
-                    acc1 += srow[sl + 1] as u64 * span.last_weight;
-                    acc2 += srow[sl + 2] as u64 * span.last_weight;
-                    acc3 += srow[sl + 3] as u64 * span.last_weight;
+                    let lw = span.last_weight;
+                    acc0 += u32::from(srow[sl]) * lw;
+                    acc1 += u32::from(srow[sl + 1]) * lw;
+                    acc2 += u32::from(srow[sl + 2]) * lw;
+                    acc3 += u32::from(srow[sl + 3]) * lw;
                 }
 
                 let o = dx * 4;
-                drow[o] = ((acc0 + half) / denom) as u8;
-                drow[o + 1] = ((acc1 + half) / denom) as u8;
-                drow[o + 2] = ((acc2 + half) / denom) as u8;
-                drow[o + 3] = ((acc3 + half) / denom) as u8;
+                drow[o] = ((acc0 + FP_HALF) >> FP_SHIFT) as u8;
+                drow[o + 1] = ((acc1 + FP_HALF) >> FP_SHIFT) as u8;
+                drow[o + 2] = ((acc2 + FP_HALF) >> FP_SHIFT) as u8;
+                drow[o + 3] = ((acc3 + FP_HALF) >> FP_SHIFT) as u8;
             }
         }
         tmp
@@ -139,40 +160,37 @@ pub fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
     }
 
     // Pass 2: vertical (dw × sh -> dw × dh)
-    let spans = build_spans(sh, dh);
-    let mid_w = dh as u64;
-    let denom = sh as u64;
-    let half = denom / 2;
+    let (spans, mid_w) = build_spans(sh, dh);
     let row_bytes = dw * 4;
     let mut out = vec![0u8; dw * dh * 4];
-    let mut accum = vec![0u64; row_bytes];
+    let mut accum = vec![0u32; row_bytes];
 
     for (dy, span) in spans.iter().enumerate() {
+        let fw = span.first_weight;
         let first_row = &horiz[span.start * row_bytes..(span.start + 1) * row_bytes];
         for (a, &b) in accum.iter_mut().zip(first_row) {
-            *a = b as u64 * span.first_weight;
+            *a = u32::from(b) * fw;
         }
 
         if span.end > span.start + 1 {
             if span.end > span.start + 2 {
-                // Accumulate interior rows separately so we only multiply by mid_w once per channel.
-                // Actually multiplying directly avoids a second buffer and is linear in memory.
                 for sy in (span.start + 1)..(span.end - 1) {
                     let row = &horiz[sy * row_bytes..(sy + 1) * row_bytes];
                     for (a, &b) in accum.iter_mut().zip(row) {
-                        *a += b as u64 * mid_w;
+                        *a += u32::from(b) * mid_w;
                     }
                 }
             }
+            let lw = span.last_weight;
             let last_row = &horiz[(span.end - 1) * row_bytes..span.end * row_bytes];
             for (a, &b) in accum.iter_mut().zip(last_row) {
-                *a += b as u64 * span.last_weight;
+                *a += u32::from(b) * lw;
             }
         }
 
         let drow = &mut out[dy * row_bytes..(dy + 1) * row_bytes];
         for (dst_b, &a) in drow.iter_mut().zip(&accum) {
-            *dst_b = ((a + half) / denom) as u8;
+            *dst_b = ((a + FP_HALF) >> FP_SHIFT) as u8;
         }
     }
 

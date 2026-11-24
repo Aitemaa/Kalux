@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Kalux
+GenericName=Image Viewer
+Comment=Instant native pure-Rust image viewer
+Exec=kalux %f
+Icon=kalux
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;Viewer;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/x-bmp;image/x-icon;image/vnd.microsoft.icon;image/tiff;
+StartupNotify=false
+StartupWMClass=kalux
+Keywords=image;photo;picture;viewer;gallery;
