@@ -113,9 +113,23 @@ window-rule {
 
 ### Windows
 
+Download `kalux-<version>-windows-x64-setup.exe` from the [Releases](https://github.com/Aitemaa/Kalux/releases) page and run it. No admin rights are needed: it installs for your user into `%LOCALAPPDATA%\Programs\Kalux` (choose "for all users" on the first page to install into Program Files instead). It adds:
+
+- a Start menu entry, so **Kalux** shows up in Windows search and `Win+R` (`kalux`)
+- optional: a desktop shortcut and an **Open with** entry for JPEG, PNG, GIF, WebP, BMP, ICO, TIFF, HEIC, AVIF, and JXL image files
+- an uninstaller in **Settings → Apps**
+
+A portable zip (`kalux-<version>-windows-x64.zip`) and standalone `kalux.exe` are attached to each release as well. To build from source:
+
 ```powershell
 cargo build --release -p kalux-app   # → target\release\kalux.exe (~647 KB)
 cargo test --workspace
+```
+
+To build the Inno Setup 6 installer locally on Windows:
+
+```powershell
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.0 /DSourceDir="$PWD\target\release" /DOutputDir="$PWD\target\release" packaging\windows\kalux.iss
 ```
 
 ## License

@@ -29,8 +29,8 @@ use windows::Win32::UI::Shell::DragAcceptFiles;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowLongW, GetWindowPlacement, HWND_TOP, IDC_ARROW, KillTimer, LoadCursorW, MINMAXINFO,
-    MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SIZE_MINIMIZED, SW_SHOW,
+    GetWindowLongW, GetWindowPlacement, HWND_TOP, IDC_ARROW, KillTimer, LoadCursorW, LoadIconW,
+    MINMAXINFO, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SIZE_MINIMIZED, SW_SHOW,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
     SetTimer, SetWindowLongPtrW, SetWindowLongW, SetWindowPlacement, SetWindowPos, SetWindowTextW,
     ShowWindow, TranslateMessage, UnregisterClassW, WINDOWPLACEMENT, WM_APP, WM_CAPTURECHANGED,
@@ -167,14 +167,18 @@ pub fn run(cfg: LaunchConfig) -> i32 {
 
     // SAFETY: Creating a solid GDI brush with a valid COLORREF matching the ka-suite canvas bg.
     let bg_brush: HBRUSH = unsafe { CreateSolidBrush(COLORREF(palette.bg.to_colorref())) };
-    // SAFETY: Loading standard system arrow cursor.
+    // SAFETY: Loading standard system arrow cursor and the embedded app icon (resource ID 1).
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
+    let icon = unsafe { LoadIconW(Some(hinstance), PCWSTR(std::ptr::without_provenance(1))) }
+        .unwrap_or_default();
 
     let wc = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_DBLCLKS,
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinstance,
+        hIcon: icon,
+        hIconSm: icon,
         hCursor: cursor,
         hbrBackground: bg_brush,
         lpszClassName: WINDOW_CLASS,

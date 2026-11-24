@@ -80,11 +80,28 @@ jobs:
             --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux"
           ls -lh screenshots-out/
 
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $release = (Resolve-Path target/release).Path
+          & $iscc /Q "/DAppVersion=$ver" "/DSourceDir=$release" "/DOutputDir=$release" packaging/windows/kalux.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item target/release/kalux-*-windows-x64-setup.exe | ForEach-Object {
+            "installer: $($_.Name) ($($_.Length) bytes)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: kalux-windows-x64
           path: |
+            target/release/kalux-*-windows-x64-setup.exe
             target/release/kalux.exe
             bench-out/startup.jsonl
             screenshots-out/*.png

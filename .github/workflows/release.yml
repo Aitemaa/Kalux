@@ -1,0 +1,152 @@
+name: Release
+
+# Push a version tag (git tag v0.1.0 && git push origin v0.1.0) to build the Windows installer,
+# portable zip, standalone executable, and Linux tarball with SHA-256 checksums and attach them
+# to a draft GitHub release. "Run workflow" builds them as artifacts without a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the workspace version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Kalux
+        run: cargo build --release -p kalux-app --locked
+
+      - name: Package Windows release zip and portable executable
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exe = "target/release/kalux.exe"
+          Copy-Item $exe dist/kalux.exe
+
+          $stage = "target/release/kalux-$ver-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $exe "$stage/kalux.exe"
+          Copy-Item LICENSE "$stage/"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/kalux-$ver-windows-x64.zip" -Force
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $source = (Resolve-Path target/release).Path
+          $out = (Resolve-Path dist).Path
+          & $iscc /Q "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$source" "/DOutputDir=$out" packaging/windows/kalux.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item dist/kalux-*-windows-x64-setup.exe | ForEach-Object { Write-Host ("{0}: {1:N0} bytes" -f $_.Name, $_.Length) }
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum kalux-*-windows-x64-setup.exe kalux.exe kalux-*-windows-x64.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -lh
+
+      - name: Attach to a draft release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/kalux-*-windows-x64-setup.exe
+            dist/kalux.exe
+            dist/kalux-*-windows-x64.zip
+            dist/SHA256SUMS.txt
+          draft: true
+          generate_release_notes: true
+
+      - name: Keep as artifacts
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kalux-${{ steps.version.outputs.version }}-windows-x64
+          path: |
+            dist/kalux-*-windows-x64-setup.exe
+            dist/kalux.exe
+            dist/kalux-*-windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the workspace version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Linux x64
+        run: cargo build --release -p kalux-app --locked
+
+      - name: Package Linux tarball and checksums
+        run: |
+          ver="${{ steps.version.outputs.version }}"
+          stage="dist/kalux-${ver}-linux-x64"
+          mkdir -p "$stage/packaging/linux" "$stage/assets"
+          cp target/release/kalux "$stage/"
+          cp packaging/linux/kalux.desktop packaging/linux/install.sh "$stage/packaging/linux/"
+          cp assets/icon.svg "$stage/assets/"
+          cp LICENSE "$stage/"
+          tar -C dist -czf "dist/kalux-${ver}-linux-x64.tar.gz" "kalux-${ver}-linux-x64"
+          (cd dist && sha256sum "kalux-${ver}-linux-x64.tar.gz" > SHA256SUMS-linux.txt && cat SHA256SUMS-linux.txt)
+
+      - name: Attach to a draft release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/kalux-*-linux-x64.tar.gz
+            dist/SHA256SUMS-linux.txt
+          draft: true
+          generate_release_notes: true
+
+      - name: Keep as artifacts
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kalux-${{ steps.version.outputs.version }}-linux-x64
+          path: |
+            dist/kalux-*-linux-x64.tar.gz
+            dist/SHA256SUMS-linux.txt
+          if-no-files-found: error

@@ -54,3 +54,6 @@ wayrs-protocols.workspace = true
 
 [build-dependencies]
 embed-manifest.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
