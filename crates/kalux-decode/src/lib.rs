@@ -6,6 +6,9 @@
 //!
 //! Backends:
 //! * JPEG: `zune-jpeg` (pure Rust) — on all platforms. EXIF orientation via `kamadak-exif`.
+//!   On Windows, when `max_size` requires ≥ 2× downscaling on both axes, we route large JPEGs
+//!   through WIC so `IWICBitmapScaler` engages native JPEG DCT scaling (`IWICBitmapSourceTransform`
+//!   1/2, 1/4, 1/8 IDCT), avoiding a full-resolution decode.
 //! * Everything else (and JPEG fallback): WIC on Windows (`cfg(windows)`), including codec
 //!   extensions (HEIF/AVIF/RAW/JXL) when installed. On non-Windows, non-JPEG returns
 //!   `DecodeError::Unsupported` (Linux is only a test host).
@@ -13,11 +16,23 @@
 //! Output is always [`kalux_core::DecodedImage`] in BGRA8 premultiplied, orientation applied,
 //! optionally downscaled to fit `max_size` (never upscaled; aspect preserved).
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+mod anim;
+mod jpeg;
+mod orient;
+mod scale;
+mod store;
+#[cfg(windows)]
+mod wic;
+
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 use kalux_core::DecodedImage;
+#[cfg(not(windows))]
+use kalux_core::ImageFormat;
+
+pub use store::{ImageStore, StoreConfig, StoreEvent};
 
 #[derive(Debug, Clone)]
 pub enum DecodeError {
@@ -34,108 +49,105 @@ pub enum DecodeError {
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _ = f;
-        todo!("kalux-decode: user-facing message")
+        match self {
+            Self::NotFound => write!(f, "File not found."),
+            Self::Unsupported { hint: Some(hint) } => {
+                write!(f, "This image format is not supported yet. {hint}.")
+            }
+            Self::Unsupported { hint: None } => {
+                write!(f, "This image format is not supported.")
+            }
+            Self::Corrupt(detail) => {
+                if detail.is_empty() {
+                    write!(f, "This image file appears to be damaged.")
+                } else {
+                    write!(f, "Could not decode image: {detail}.")
+                }
+            }
+            Self::Io(detail) => write!(f, "Could not read file: {detail}."),
+            Self::Cancelled => write!(f, "Image decode was cancelled."),
+        }
     }
 }
 
 impl std::error::Error for DecodeError {}
 
+/// Read up to 16 leading bytes of `path` to sniff the container magic and detect missing files.
+fn read_header(path: &Path) -> Result<(usize, [u8; 16]), DecodeError> {
+    let mut file = File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => DecodeError::NotFound,
+        _ => DecodeError::Io(e.to_string()),
+    })?;
+    let mut buf = [0u8; 16];
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| DecodeError::Io(e.to_string()))?;
+    Ok((n, buf))
+}
+
+/// On Windows, decide whether WIC's native DCT-scaled JPEG decode (`1/2`, `1/4`, `1/8` IDCT via
+/// `IWICBitmapSourceTransform`) beats `zune-jpeg` full decode + CPU box downscale.
+///
+/// WIC DCT scaling skips at least 75% of IDCT & color-conversion work once the source is ≥ 2×
+/// larger than `max_size` on both axes (e.g. 12 MP 4000×3000 -> 1920×1080). For full-resolution
+/// decodes (`max_size == None`) or images close to the target size, `zune-jpeg` stays faster and
+/// avoids COM/WIC overhead.
+#[cfg(windows)]
+fn prefer_wic_for_jpeg(path: &Path, max_size: Option<(u32, u32)>) -> bool {
+    let Some((mw, mh)) = max_size else {
+        return false;
+    };
+    if mw == 0 || mh == 0 {
+        return false;
+    }
+    let Some((raw_w, raw_h)) = jpeg::probe_jpeg_dimensions(path) else {
+        return false;
+    };
+    // Compare conservatively against max(mw, mh) so 90°/270° rotated JPEGs still qualify accurately.
+    let target_long = mw.max(mh);
+    let target_short = mw.min(mh);
+    let src_long = raw_w.max(raw_h);
+    let src_short = raw_w.min(raw_h);
+    src_long >= target_long.saturating_mul(2) && src_short >= target_short.saturating_mul(2)
+}
+
 /// Decode `path`. When `max_size` is `Some((w, h))`, the result fits inside `w×h`
 /// (use decoder-native scaling where possible: zune/WIC DCT scaling, `IWICBitmapScaler`).
 /// Must be callable from any thread (initialise COM per thread on Windows, MTA).
 pub fn decode_file(path: &Path, max_size: Option<(u32, u32)>) -> Result<DecodedImage, DecodeError> {
-    let _ = (path, max_size);
-    todo!("kalux-decode")
-}
-
-#[derive(Clone, Debug)]
-pub struct StoreConfig {
-    /// Worker threads. Default: min(available_parallelism - 1, 4), at least 1.
-    pub threads: usize,
-    /// Cache budget in bytes. Default 128 MiB.
-    pub cache_budget: usize,
-    /// How many neighbors on each side to preload. Default 2.
-    pub preload_radius: usize,
-}
-
-impl Default for StoreConfig {
-    fn default() -> Self {
-        todo!("kalux-decode")
-    }
-}
-
-#[derive(Debug)]
-pub enum StoreEvent {
-    /// A decode finished for `path`. `full_resolution` is true when it was decoded without `max_size`.
-    Ready {
-        path: PathBuf,
-        image: Arc<DecodedImage>,
-        full_resolution: bool,
-        elapsed: Duration,
-    },
-    Failed {
-        path: PathBuf,
-        error: DecodeError,
-    },
-}
-
-/// Background decoder + cache. Owned by the UI thread; not `Sync`.
-pub struct ImageStore {
-    _private: (),
-}
-
-impl ImageStore {
-    /// Start workers. `notify` is called from a worker thread whenever a result is queued;
-    /// the app uses it to `PostMessageW` its window so the UI thread calls [`poll`](Self::poll).
-    pub fn new(config: StoreConfig, notify: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let _ = (config, notify);
-        todo!("kalux-decode")
+    let (n, header) = read_header(path)?;
+    if n == 0 {
+        return Err(DecodeError::Corrupt("file is empty".into()));
     }
 
-    /// Make `current` the focused image and preload `neighbors` (nearest first).
-    /// * Returns the cached image immediately if present (no event will be sent for it).
-    /// * Otherwise queues `current` at top priority; neighbors after it.
-    /// * Queued-but-not-started jobs for paths no longer in {current} ∪ neighbors are dropped.
-    /// * Pins current + neighbors in the cache.
-    /// `target` is the client size in physical px; images are decoded to fit it.
-    pub fn focus(
-        &mut self,
-        current: &Path,
-        neighbors: &[PathBuf],
-        target: (u32, u32),
-    ) -> Option<Arc<DecodedImage>> {
-        let _ = (current, neighbors, target);
-        todo!("kalux-decode")
+    let is_jpeg = jpeg::is_jpeg_magic(&header[..n]);
+
+    #[cfg(windows)]
+    {
+        if is_jpeg {
+            if prefer_wic_for_jpeg(path, max_size) {
+                match wic::decode_file_wic(path, max_size) {
+                    Ok(img) => return Ok(img),
+                    Err(_) => return jpeg::decode_jpeg_file(path, max_size),
+                }
+            }
+            match jpeg::decode_jpeg_file(path, max_size) {
+                Ok(img) => return Ok(img),
+                Err(_) => return wic::decode_file_wic(path, max_size),
+            }
+        }
+        wic::decode_file_wic(path, max_size)
     }
 
-    /// Queue a full-resolution decode of `path` (when the user zooms past the downscaled detail).
-    /// Result arrives as `Ready { full_resolution: true }` and replaces the cached entry.
-    pub fn request_full_resolution(&mut self, path: &Path) {
-        let _ = path;
-        todo!("kalux-decode")
-    }
-
-    /// Drain finished jobs (non-blocking). Results are inserted into the cache before being returned.
-    pub fn poll(&mut self) -> Vec<StoreEvent> {
-        todo!("kalux-decode")
-    }
-
-    /// Forget a path (file rotated/deleted/changed on disk).
-    pub fn invalidate(&mut self, path: &Path) {
-        let _ = path;
-        todo!("kalux-decode")
-    }
-
-    /// Target size changed significantly (e.g. moved to a 4K monitor / fullscreen). Cached images
-    /// smaller than needed are re-requested on next focus.
-    pub fn set_target(&mut self, target: (u32, u32)) {
-        let _ = target;
-        todo!("kalux-decode")
-    }
-
-    /// Current cache weight in bytes (for `--bench` reporting).
-    pub fn cache_bytes(&self) -> usize {
-        todo!("kalux-decode")
+    #[cfg(not(windows))]
+    {
+        if is_jpeg {
+            return jpeg::decode_jpeg_file(path, max_size);
+        }
+        // If the file has a JPEG extension but invalid magic bytes, report Corrupt instead of Unsupported.
+        if ImageFormat::from_path(path) == Some(ImageFormat::Jpeg) {
+            return Err(DecodeError::Corrupt("invalid JPEG header".into()));
+        }
+        Err(DecodeError::Unsupported { hint: None })
     }
 }
