@@ -10,10 +10,12 @@ pub mod action;
 pub mod cache;
 pub mod image;
 pub mod nav;
+pub mod theme;
 pub mod view;
 
 pub use action::{Action, Modifiers, action_for_key};
 pub use cache::{ByteLru, Weighted};
 pub use image::{DecodedImage, Frame, ImageFormat, SUPPORTED_EXTENSIONS};
 pub use nav::{Playlist, natural_cmp};
+pub use theme::{Palette, Rgba};
 pub use view::{Rect, View, ZoomMode};

@@ -12,6 +12,8 @@ mod overlay;
 #[cfg(windows)]
 mod render;
 #[cfg(windows)]
+mod screenshot;
+#[cfg(windows)]
 mod testimg;
 #[cfg(windows)]
 mod window;
@@ -80,6 +82,42 @@ fn run_windows(main_start: std::time::Instant) -> i32 {
             let _com = ComGuard(com_ok);
 
             if let Err(err) = testimg::generate_test_jpeg(&out, width, height) {
+                attach_console_if_needed();
+                let mut stderr = std::io::stderr().lock();
+                let _ = writeln!(stderr, "kalux: {err}");
+                let _ = stderr.flush();
+                return 1;
+            }
+            0
+        }
+
+        Ok(Command::Screenshot {
+            image,
+            out,
+            light,
+            show_help,
+            toast,
+            title,
+            width,
+            height,
+        }) => {
+            // SAFETY: Initialize COM STA on the main thread for WIC + Direct2D.
+            let com_ok =
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
+                    .is_ok();
+            let _com = ComGuard(com_ok);
+
+            let opts = screenshot::ScreenshotOptions {
+                image,
+                out,
+                light,
+                show_help,
+                toast,
+                title,
+                width,
+                height,
+            };
+            if let Err(err) = screenshot::render_screenshot(&opts) {
                 attach_console_if_needed();
                 let mut stderr = std::io::stderr().lock();
                 let _ = writeln!(stderr, "kalux: {err}");

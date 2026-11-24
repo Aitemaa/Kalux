@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kalux_core::{Action, DecodedImage, Playlist, View};
+use kalux_core::{Action, DecodedImage, Palette, Playlist, View};
 use kalux_decode::{DecodeError, ImageStore, StoreConfig, StoreEvent};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -22,6 +22,7 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromWindow, PAINTSTRUCT, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::DragAcceptFiles;
@@ -35,8 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, TranslateMessage, UnregisterClassW, WINDOWPLACEMENT, WM_APP, WM_CAPTURECHANGED,
     WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_ACCEPTFILES,
-    WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSEXW,
+    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -58,9 +59,6 @@ const TIMER_BENCH_TIMEOUT: usize = 4;
 const TOAST_DURATION_MS: u32 = 1200;
 const BENCH_SAMPLE_DELAY_MS: u32 = 1000;
 const BENCH_TIMEOUT_MS: u32 = 30_000;
-
-/// Dark background color `#141416` in Win32 `COLORREF` (`0x00BBGGRR`) format.
-const BG_COLORREF: COLORREF = COLORREF(0x0016_1414);
 
 /// Keyboard zoom multiplier (`+` / `-`).
 const KEY_ZOOM_FACTOR: f32 = 1.25;
@@ -85,6 +83,7 @@ struct AppState {
     monitor_size: (u32, u32),
     client_size: (u32, u32),
     dpi: u32,
+    palette: Palette,
 
     renderer: Option<Renderer>,
 
@@ -164,8 +163,10 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         .map(HINSTANCE::from)
         .unwrap_or_default();
 
-    // SAFETY: Creating a solid GDI brush with a valid COLORREF.
-    let bg_brush: HBRUSH = unsafe { CreateSolidBrush(BG_COLORREF) };
+    let palette = system_palette();
+
+    // SAFETY: Creating a solid GDI brush with a valid COLORREF matching the ka-suite canvas bg.
+    let bg_brush: HBRUSH = unsafe { CreateSolidBrush(COLORREF(palette.bg.to_colorref())) };
     // SAFETY: Loading standard system arrow cursor.
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
 
@@ -197,6 +198,7 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         monitor_size,
         client_size: (win_w.max(1) as u32, win_h.max(1) as u32),
         dpi: 96,
+        palette,
         renderer: None,
         playlist,
         focused_path,
@@ -251,8 +253,8 @@ pub fn run(cfg: LaunchConfig) -> i32 {
     // Publish HWND to background workers now that the window exists.
     hwnd_slot.store(hwnd.0 as isize, Ordering::Release);
 
-    // Apply native Windows 11 dark title bar + Mica backdrop (gracefully ignored on Windows 10).
-    apply_dark_chrome(hwnd);
+    // Apply native Windows 11 title bar theme + Mica backdrop (gracefully ignored on Windows 10).
+    apply_chrome(hwnd, state.palette.is_dark);
 
     // SAFETY: `hwnd` is valid.
     unsafe { DragAcceptFiles(hwnd, true) };
@@ -271,7 +273,7 @@ pub fn run(cfg: LaunchConfig) -> i32 {
     }
 
     // Create Direct2D factory + HwndRenderTarget.
-    match Renderer::new(hwnd, state.client_size) {
+    match Renderer::new(hwnd, state.client_size, state.palette) {
         Ok(renderer) => state.renderer = Some(renderer),
         Err(e) => {
             if state.bench.is_some() {
@@ -1139,6 +1141,20 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_SETTINGCHANGE => {
+            let next = system_palette();
+            if next.is_dark != state.palette.is_dark {
+                state.palette = next;
+                apply_chrome(hwnd, next.is_dark);
+                if let Some(renderer) = state.renderer.as_mut() {
+                    renderer.set_palette(next);
+                }
+                invalidate(hwnd);
+            }
+            // SAFETY: Let Windows finish default setting-change handling.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
         WM_DESTROY => {
             state.hwnd_slot.store(0, Ordering::Release);
             // SAFETY: Kill all timers and post quit message with `exit_code`.
@@ -1159,8 +1175,30 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-fn apply_dark_chrome(hwnd: HWND) {
-    let dark: i32 = 1;
+fn system_palette() -> Palette {
+    let mut val: u32 = 0;
+    let mut len: u32 = size_of::<u32>() as u32;
+    // SAFETY: Reading a single REG_DWORD from HKCU Personalize; stack pointers are valid.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut val as *mut u32).cast::<c_void>()),
+            Some(&mut len),
+        )
+    };
+    if status.is_ok() {
+        Palette::for_light(val != 0)
+    } else {
+        Palette::DARK
+    }
+}
+
+fn apply_chrome(hwnd: HWND, is_dark: bool) {
+    let dark: i32 = i32::from(is_dark);
     // SAFETY: Passing a valid 4-byte `BOOL` for `DWMWA_USE_IMMERSIVE_DARK_MODE`.
     let _ = unsafe {
         DwmSetWindowAttribute(

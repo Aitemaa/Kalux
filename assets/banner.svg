@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" width="1280" height="320" role="img" aria-label="Kalux: instant native image viewer for Windows">
+  <defs><filter id="grain" x="-5%" y="-5%" width="110%" height="110%" color-interpolation-filters="sRGB"><feTurbulence type="fractalNoise" baseFrequency="0.65" numOctaves="3" seed="4" result="noise"/><feColorMatrix in="noise" type="matrix" values="0.33 0.33 0.33 0 0 0.33 0.33 0.33 0 0 0.33 0.33 0.33 0 0 0 0 0 0 1" result="grey"/><feComponentTransfer in="grey" result="mask"><feFuncR type="linear" slope="0.883" intercept="0.443"/><feFuncG type="linear" slope="0.883" intercept="0.443"/><feFuncB type="linear" slope="0.883" intercept="0.443"/></feComponentTransfer><feComposite in="SourceGraphic" in2="mask" operator="arithmetic" k1="1" k2="0" k3="0" k4="0"/></filter></defs>
+  <rect width="1280" height="320" rx="24" fill="#141414"/>
+  <rect x="253.2" y="77.5" width="165" height="165" rx="37.125" fill="#222222"/>
+  <g transform="translate(247.7 72) scale(0.171875)">
+    <circle cx="512" cy="512" r="392" stroke="#4a4a4a" stroke-width="38" fill="none"/>
+  </g>
+  <g filter="url(#grain)">
+    <g transform="translate(247.7 72) scale(0.171875)" stroke="#ffffff" stroke-width="72" stroke-linecap="round">
+      <line x1="327.4" y1="268.0" x2="327.4" y2="756.0"/>
+      <line x1="497.2" y1="445.4" x2="688.6" y2="268.0"/>
+      <line x1="497.2" y1="578.6" x2="688.6" y2="756.0"/>
+    </g>
+    <g transform="translate(489.2 104) scale(1.12)" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <line x1="0.0" y1="0.0" x2="0.0" y2="100.0"/>
+      <line x1="24.1" y1="41.3" x2="74.0" y2="0.0"/>
+      <line x1="24.1" y1="58.7" x2="74.0" y2="100.0"/>
+      <polyline points="110,100 149,0 188,100"/>
+      <polyline points="224,0 224,100 282,100"/>
+      <path d="M314 0 V64 A32 36 0 0 0 378 64 V0"/>
+      <path d="M414 0 480 100M480 0 414 100"/>
+    </g>
+  </g>
+  <g transform="translate(247.7 72) scale(0.171875)">
+    <path d="M425.4 446 Q425.4 512 480.4 512 Q425.4 512 425.4 578 Q425.4 512 370.4 512 Q425.4 512 425.4 446 Z" fill="#e8262d"/>
+  </g>
+  <g transform="translate(489.2 104) scale(1.12)">
+    <path d="M13.6 40.5 Q13.6 50 21.6 50 Q13.6 50 13.6 59.5 Q13.6 50 5.6 50 Q13.6 50 13.6 40.5 Z" fill="#e8262d"/>
+  </g>
+</svg>

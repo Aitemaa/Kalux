@@ -33,6 +33,7 @@ windows = { workspace = true, features = [
   "Win32_System_Ole",
   "Win32_System_Performance",
   "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_System_Variant",
@@ -41,6 +42,7 @@ windows = { workspace = true, features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+windows-numerics.workspace = true
 
 [build-dependencies]
 embed-manifest.workspace = true

@@ -20,6 +20,17 @@ pub enum Command {
         width: u32,
         height: u32,
     },
+    /// Render an offscreen PNG screenshot of Kalux showing `image` (Direct2D + DirectWrite).
+    Screenshot {
+        image: PathBuf,
+        out: PathBuf,
+        light: bool,
+        show_help: bool,
+        toast: Option<String>,
+        title: Option<String>,
+        width: u32,
+        height: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +75,7 @@ where
             "--version" | "-V" => return Ok(Command::Version),
             "--bench-startup" => return parse_bench_startup(iter),
             "--gen-test-image" => return parse_gen_test_image(iter),
+            "--screenshot" => return parse_screenshot(iter),
             "--" => {
                 let file = iter.next().filter(|s| !s.is_empty()).map(PathBuf::from);
                 return Ok(Command::Open { file });
@@ -139,6 +151,68 @@ fn parse_gen_test_image(mut iter: impl Iterator<Item = OsString>) -> Result<Comm
 
     Ok(Command::GenTestImage {
         out: PathBuf::from(out),
+        width,
+        height,
+    })
+}
+
+fn parse_screenshot(mut iter: impl Iterator<Item = OsString>) -> Result<Command, ArgError> {
+    let usage = "Usage: kalux --screenshot <image> <out.png> [--light] [--help] [--toast <text>] [--title <text>] [--width <w>] [--height <h>]";
+    let image = iter.next().ok_or_else(|| ArgError::cli(usage))?;
+    let out = iter.next().ok_or_else(|| ArgError::cli(usage))?;
+    let mut light = false;
+    let mut show_help = false;
+    let mut toast: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut width: u32 = 1280;
+    let mut height: u32 = 760;
+
+    while let Some(arg) = iter.next() {
+        let Some(flag) = arg.to_str() else {
+            return Err(ArgError::cli("Invalid UTF-8 flag to --screenshot"));
+        };
+        match flag {
+            "--light" => light = true,
+            "--help" => show_help = true,
+            "--toast" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| ArgError::cli("--toast requires a value"))?;
+                toast = Some(v.to_string_lossy().into_owned());
+            }
+            "--title" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| ArgError::cli("--title requires a value"))?;
+                title = Some(v.to_string_lossy().into_owned());
+            }
+            "--width" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| ArgError::cli("--width requires a number"))?;
+                width = parse_dim(&v, "width")?;
+            }
+            "--height" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| ArgError::cli("--height requires a number"))?;
+                height = parse_dim(&v, "height")?;
+            }
+            other => {
+                return Err(ArgError::cli(format!(
+                    "Unknown option for --screenshot: {other}"
+                )));
+            }
+        }
+    }
+
+    Ok(Command::Screenshot {
+        image: PathBuf::from(image),
+        out: PathBuf::from(out),
+        light,
+        show_help,
+        toast,
+        title,
         width,
         height,
     })
@@ -240,5 +314,38 @@ mod tests {
         );
         assert!(parse_args(os(&["--gen-test-image", "out.jpg", "0", "100"])).is_err());
         assert!(parse_args(os(&["--gen-test-image", "out.jpg", "100"])).is_err());
+    }
+
+    #[test]
+    fn screenshot_variants() {
+        assert_eq!(
+            parse_args(os(&[
+                "--screenshot",
+                "in.jpg",
+                "out.png",
+                "--light",
+                "--help",
+                "--toast",
+                "100%",
+                "--title",
+                "demo.jpg — Kalux",
+                "--width",
+                "1280",
+                "--height",
+                "760",
+            ])),
+            Ok(Command::Screenshot {
+                image: PathBuf::from("in.jpg"),
+                out: PathBuf::from("out.png"),
+                light: true,
+                show_help: true,
+                toast: Some("100%".to_string()),
+                title: Some("demo.jpg — Kalux".to_string()),
+                width: 1280,
+                height: 760,
+            })
+        );
+        assert!(parse_args(os(&["--screenshot", "in.jpg"])).is_err());
+        assert!(parse_args(os(&["--screenshot", "in.jpg", "out.png", "--bad"])).is_err());
     }
 }

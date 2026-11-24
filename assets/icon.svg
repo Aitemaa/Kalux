@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Kavox family: dark tile + split K. Kalux: lens ring + red 4-point light glint (lux). -->
+  <rect x="32" y="32" width="960" height="960" rx="216" fill="#222222"/>
+  <circle cx="512" cy="512" r="392" stroke="#4a4a4a" stroke-width="38" fill="none"/>
+  <g stroke="#ffffff" stroke-width="72" stroke-linecap="round">
+    <line x1="327.4" y1="268.0" x2="327.4" y2="756.0"/>
+    <line x1="497.2" y1="445.4" x2="688.6" y2="268.0"/>
+    <line x1="497.2" y1="578.6" x2="688.6" y2="756.0"/>
+  </g>
+  <path d="M425.4 446 Q425.4 512 480.4 512 Q425.4 512 425.4 578 Q425.4 512 370.4 512 Q425.4 512 425.4 446 Z" fill="#e8262d"/>
+</svg>

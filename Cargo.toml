@@ -14,6 +14,7 @@ repository = "https://github.com/Aitemaa/Kalux"
 kalux-core = { path = "crates/kalux-core" }
 kalux-decode = { path = "crates/kalux-decode" }
 windows = "0.62"
+windows-numerics = "0.3"
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 zune-core = "0.5"
 kamadak-exif = "0.6"

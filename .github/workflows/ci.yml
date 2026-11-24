@@ -68,6 +68,18 @@ jobs:
           Get-Content bench-out/startup.jsonl | Out-File -Append $env:GITHUB_STEP_SUMMARY
           "``````" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
+      - name: Render screenshots (Direct2D + DirectWrite)
+        shell: bash
+        run: |
+          mkdir -p screenshots-out
+          ./target/release/kalux.exe --screenshot assets/demo-photo.jpg screenshots-out/viewer-dark.png \
+            --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux" \
+            --toast "100% · Fit"
+          ./target/release/kalux.exe --screenshot assets/demo-photo.jpg screenshots-out/shortcuts-light.png \
+            --light --help \
+            --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux"
+          ls -lh screenshots-out/
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -75,6 +87,7 @@ jobs:
           path: |
             target/release/kalux.exe
             bench-out/startup.jsonl
+            screenshots-out/*.png
           if-no-files-found: ignore
 
   linux-core:

@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use kalux_core::{DecodedImage, Rect};
+use kalux_core::{DecodedImage, Palette, Rect};
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
@@ -14,20 +14,12 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_INTERPOLATION_MODE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1CreateFactory, ID2D1Bitmap,
-    ID2D1DeviceContext, ID2D1Factory, ID2D1HwndRenderTarget,
+    ID2D1DeviceContext, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::Interface;
 
-use crate::overlay::{OverlayRenderer, OverlayView};
-
-/// Dark neutral canvas background (`#141416`).
-const BG_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 0.078,
-    g: 0.078,
-    b: 0.086,
-    a: 1.0,
-};
+use crate::overlay::{OverlayRenderer, OverlayView, rgba_to_d2d};
 
 /// Animations whose decoded frames total <= 32 MiB cache one D2D bitmap per frame (lazily uploaded).
 /// Larger animations reuse a single D2D bitmap via `CopyFromMemory` to keep VRAM bounded.
@@ -133,6 +125,7 @@ pub struct Renderer {
     factory: ID2D1Factory,
     hwnd: HWND,
     client_size: (u32, u32),
+    palette: Palette,
     target: Option<ID2D1HwndRenderTarget>,
     device_context: Option<ID2D1DeviceContext>,
     current: Option<GpuImage>,
@@ -140,7 +133,11 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(hwnd: HWND, client_size: (u32, u32)) -> windows::core::Result<Self> {
+    pub fn new(
+        hwnd: HWND,
+        client_size: (u32, u32),
+        palette: Palette,
+    ) -> windows::core::Result<Self> {
         // SAFETY: Creating a single-threaded Direct2D factory on the UI thread is safe.
         let factory: ID2D1Factory =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }?;
@@ -149,6 +146,7 @@ impl Renderer {
             factory,
             hwnd,
             client_size,
+            palette,
             target: None,
             device_context: None,
             current: None,
@@ -156,6 +154,10 @@ impl Renderer {
         };
         renderer.ensure_target()?;
         Ok(renderer)
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
     }
 
     /// Replace the displayed image (drops previous GPU bitmaps immediately).
@@ -232,11 +234,13 @@ impl Renderer {
                 None
             };
 
+        let bg = rgba_to_d2d(self.palette.bg);
+
         // SAFETY: Valid D2D render target; paired with `EndDraw` below.
         unsafe { target.BeginDraw() };
 
         // SAFETY: Inside BeginDraw..EndDraw.
-        unsafe { target.Clear(Some(&BG_COLOR)) };
+        unsafe { target.Clear(Some(&bg)) };
 
         if let (Some((bitmap, bmp_dims)), Some(rect)) = (bitmap_to_draw, dest) {
             let d2d_rect = D2D_RECT_F {
@@ -266,7 +270,8 @@ impl Renderer {
             drew_image = true;
         }
 
-        self.overlays.draw(&target, self.client_size, dpi, overlays);
+        self.overlays
+            .draw(&target, self.client_size, dpi, self.palette, overlays);
 
         // SAFETY: Pairs with `BeginDraw` above.
         unsafe { target.EndDraw(None, None) }?;
@@ -317,8 +322,8 @@ impl Renderer {
     }
 }
 
-fn create_d2d_bitmap(
-    target: &ID2D1HwndRenderTarget,
+pub fn create_d2d_bitmap(
+    target: &ID2D1RenderTarget,
     width: u32,
     height: u32,
     pitch: u32,
@@ -337,7 +342,7 @@ fn create_d2d_bitmap(
     unsafe { target.CreateBitmap(size, Some(pixels.as_ptr().cast()), pitch, &props) }
 }
 
-fn choose_interpolation(
+pub fn choose_interpolation(
     dest: Rect,
     bmp_dims: (u32, u32),
     view_scale: f32,
