@@ -163,36 +163,37 @@ fn same_file_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
     #[cfg(windows)]
     {
-        if let (Some(sa), Some(sb)) = (a.to_str(), b.to_str())
-            && sa.eq_ignore_ascii_case(sb)
-        {
-            return true;
-        }
+        a == b
+            || a.to_str()
+                .zip(b.to_str())
+                .is_some_and(|(sa, sb)| sa.eq_ignore_ascii_case(sb))
     }
-    false
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 fn is_hidden_entry(entry: &std::fs::DirEntry) -> bool {
-    if entry.file_name().to_string_lossy().starts_with('.') {
-        return true;
-    }
+    let dot_file = entry.file_name().to_string_lossy().starts_with('.');
     #[cfg(windows)]
     {
+        if dot_file {
+            return true;
+        }
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
         const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-        if let Ok(meta) = entry.metadata()
-            && (meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0
-        {
-            return true;
-        }
+        entry.metadata().is_ok_and(|meta| {
+            (meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) != 0
+        })
     }
-    false
+    #[cfg(not(windows))]
+    {
+        dot_file
+    }
 }
 
 fn is_regular_file(entry: &std::fs::DirEntry) -> bool {
