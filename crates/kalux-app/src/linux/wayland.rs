@@ -10,24 +10,34 @@
 //! - `poll(2)` event loop sleeping with infinite timeout when idle (0% idle CPU)
 
 use std::ffi::CString;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kalux_core::action::{Modifiers, action_for_linux_evdev};
+use kalux_core::action::{
+    EVDEV_KEY_COMPARE, EditAction, Modifiers, action_for_linux_evdev, edit_action_for_linux_evdev,
+};
+use kalux_core::edit::{EditDrag, edit_image_dest_rect, hit_test_crop};
 use kalux_core::view::ZoomMode;
-use kalux_core::{Action, DecodedImage, Palette, Playlist, View};
-use kalux_decode::{DecodeError, ImageStore, StoreConfig, StoreEvent};
+use kalux_core::{
+    Action, CropHandle, CropRect, DecodedImage, DockButton, DockLayout, EditPrompt, EditSession,
+    EditTab, ImageFormat, Palette, Playlist, QuarterTurns, Rect, View,
+};
+use kalux_decode::{
+    DecodeError, ExportError, ExportOptions, ExportResult, ImageStore, StoreConfig, StoreEvent,
+    encode_png_bytes, export_image, render_edited_image, supports_in_place_overwrite,
+};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::{read, write};
 use rustix::pipe::{PipeFlags, pipe_with};
 use wayrs_client::object::Proxy;
 use wayrs_client::protocol::{
-    WlCallback, WlCompositor, WlDataDevice, WlDataDeviceManager, WlDataOffer, WlKeyboard,
-    WlPointer, WlSeat, WlShm, WlSurface, wl_callback, wl_data_device, wl_data_device_manager,
-    wl_data_offer, wl_keyboard, wl_pointer, wl_seat, wl_surface,
+    WlCallback, WlCompositor, WlDataDevice, WlDataDeviceManager, WlDataOffer, WlDataSource,
+    WlKeyboard, WlPointer, WlSeat, WlShm, WlSurface, wl_callback, wl_data_device,
+    wl_data_device_manager, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_seat,
+    wl_surface,
 };
 use wayrs_client::{Connection, EventCtx, IoMode};
 use wayrs_protocols::cursor_shape_v1::{
@@ -45,6 +55,7 @@ use wayrs_protocols::xdg_shell::{
 };
 
 use crate::linux::bench::BenchState;
+use crate::linux::edit_ui::draw_edit_ui;
 use crate::linux::overlay::{ErrorCard, LinuxOverlay, OverlayView};
 use crate::linux::render::Canvas;
 use crate::linux::shm::ShmSwapchain;
@@ -53,7 +64,7 @@ use crate::linux::theme::system_palette;
 const DEFAULT_LOGICAL_W: u32 = 1180;
 const DEFAULT_LOGICAL_H: u32 = 760;
 const DEFAULT_DECODE_TARGET: (u32, u32) = (2560, 1440);
-const TOAST_DURATION: Duration = Duration::from_millis(1200);
+const TOAST_DURATION: Duration = Duration::from_millis(1400);
 const DOUBLE_CLICK_MAX_GAP: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_MAX_DIST_SQ: f64 = 36.0;
 const BENCH_SAMPLE_DELAY: Duration = Duration::from_millis(500);
@@ -79,8 +90,15 @@ pub struct LaunchConfig {
     pub bench: Option<BenchState>,
 }
 
+struct ExportOutcome {
+    save_copy: bool,
+    result: Result<ExportResult, ExportError>,
+}
+
 type SharedScanResult = Arc<Mutex<Option<(u64, Playlist)>>>;
 type SharedDropResult = Arc<Mutex<Option<PathBuf>>>;
+type SharedExportResult = Arc<Mutex<Option<ExportOutcome>>>;
+type SharedClipboardResult = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
 
 struct WakePipe {
     read_fd: OwnedFd,
@@ -136,7 +154,10 @@ struct WaylandApp {
     _fractional_scale: Option<WpFractionalScaleV1>,
     cursor_shape_mgr: Option<WpCursorShapeManagerV1>,
     cursor_shape_dev: Option<WpCursorShapeDeviceV1>,
-    _data_device: Option<WlDataDevice>,
+    data_device_mgr: Option<WlDataDeviceManager>,
+    data_device: Option<WlDataDevice>,
+    clipboard_source: Option<WlDataSource>,
+    clipboard_png: Arc<Mutex<Option<Vec<u8>>>>,
     keyboard: Option<WlKeyboard>,
     pointer: Option<WlPointer>,
     frame_cb: Option<WlCallback>,
@@ -173,6 +194,13 @@ struct WaylandApp {
     view: View,
     full_res_requested: bool,
 
+    // Edit Mode state (`None` = zero Edit Mode RAM overhead)
+    edit: Option<EditSession>,
+    export_result: SharedExportResult,
+    clipboard_result: SharedClipboardResult,
+    last_slider_click: Option<(Instant, kalux_core::ToneSlider)>,
+    compare_via_dock: bool,
+
     // Animation
     frame_index: usize,
     loops_completed: u32,
@@ -185,12 +213,13 @@ struct WaylandApp {
     active_repeat: Option<RepeatState>,
     pointer_pos_logical: (f64, f64),
     pointer_enter_serial: u32,
+    last_input_serial: u32,
     dragging: bool,
     last_drag_phys: (f32, f32),
     last_left_click: Option<(Instant, (f64, f64))>,
     scroll_v120_accum: i32,
     scroll_px_accum: f64,
-    last_cursor_grab: u8, // 0=default, 1=grab, 2=grabbing
+    last_cursor_shape: u8,
 
     // Drag-and-drop state
     dnd_offers: Vec<DndOfferState>,
@@ -253,6 +282,11 @@ impl WaylandApp {
     }
 
     fn update_title(&self, conn: &mut Connection<Self>) {
+        let editing_tag = if self.edit.is_some() {
+            " — Editing"
+        } else {
+            ""
+        };
         let title = match (&self.focused_path, &self.current_image) {
             (Some(path), Some(img)) => {
                 let name = path
@@ -265,7 +299,7 @@ impl WaylandApp {
                     .map(|pl| format!("{} / {}", pl.index() + 1, pl.len()))
                     .unwrap_or_else(|| "1 / 1".to_string());
                 format!(
-                    "{name} — {pos} — {}×{} — Kalux",
+                    "{name} — {pos} — {}×{}{editing_tag} — Kalux",
                     img.source_width, img.source_height
                 )
             }
@@ -274,7 +308,7 @@ impl WaylandApp {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                format!("{name} — Kalux")
+                format!("{name}{editing_tag} — Kalux")
             }
             (None, _) => "Kalux".to_string(),
         };
@@ -284,21 +318,54 @@ impl WaylandApp {
     }
 
     fn update_cursor(&mut self, conn: &mut Connection<Self>) {
-        let desired: u8 = if self.dragging {
+        // 0=Default, 1=Grab, 2=Grabbing, 3=Pointer, 4=Move, 5=NwseResize, 6=NeswResize, 7=NsResize, 8=EwResize, 9=Crosshair
+        let desired: u8 = if let Some(ref session) = self.edit {
+            let handle = match session.drag {
+                Some(EditDrag::CropHandle { handle, .. }) => Some(handle),
+                Some(EditDrag::NewCrop { .. }) => return,
+                Some(EditDrag::Slider { .. }) => {
+                    // Keep grabbing/ew-resize while scrubbing a slider
+                    Some(CropHandle::E)
+                }
+                None => session.hovered_handle,
+            };
+            if session.hovered_button.is_some()
+                && !matches!(session.drag, Some(EditDrag::Slider { .. }))
+            {
+                3
+            } else if let Some(h) = handle {
+                match h {
+                    CropHandle::Nw | CropHandle::Se => 5,
+                    CropHandle::Ne | CropHandle::Sw => 6,
+                    CropHandle::N | CropHandle::S => 7,
+                    CropHandle::E | CropHandle::W => 8,
+                    CropHandle::Move => 4,
+                }
+            } else {
+                0
+            }
+        } else if self.dragging {
             2
         } else if self.is_pannable() {
             1
         } else {
             0
         };
-        if desired == self.last_cursor_grab {
+        if desired == self.last_cursor_shape {
             return;
         }
-        self.last_cursor_grab = desired;
+        self.last_cursor_shape = desired;
         if let Some(dev) = self.cursor_shape_dev {
             let shape = match desired {
-                2 => wp_cursor_shape_device_v1::Shape::Grabbing,
                 1 => wp_cursor_shape_device_v1::Shape::Grab,
+                2 => wp_cursor_shape_device_v1::Shape::Grabbing,
+                3 => wp_cursor_shape_device_v1::Shape::Pointer,
+                4 => wp_cursor_shape_device_v1::Shape::Move,
+                5 => wp_cursor_shape_device_v1::Shape::NwseResize,
+                6 => wp_cursor_shape_device_v1::Shape::NeswResize,
+                7 => wp_cursor_shape_device_v1::Shape::NsResize,
+                8 => wp_cursor_shape_device_v1::Shape::EwResize,
+                9 => wp_cursor_shape_device_v1::Shape::Crosshair,
                 _ => wp_cursor_shape_device_v1::Shape::Default,
             };
             dev.set_shape(conn, self.pointer_enter_serial, shape);
@@ -306,6 +373,9 @@ impl WaylandApp {
     }
 
     fn is_pannable(&self) -> bool {
+        if self.edit.is_some() {
+            return false;
+        }
         let Some(ref img) = self.current_image else {
             return false;
         };
@@ -331,6 +401,8 @@ impl WaylandApp {
     }
 
     fn open_file(&mut self, conn: &mut Connection<Self>, path: PathBuf, rescan: bool) {
+        self.edit = None;
+        self.compare_via_dock = false;
         self.focused_path = Some(path.clone());
         self.error = None;
         self.full_res_requested = false;
@@ -430,6 +502,689 @@ impl WaylandApp {
         });
     }
 
+    fn enter_edit_mode(&mut self, conn: &mut Connection<Self>, tab: EditTab) {
+        let (Some(img), Some(path)) = (self.current_image.as_ref(), self.focused_path.clone())
+        else {
+            return;
+        };
+        if self.edit.is_some() {
+            if let Some(ref mut s) = self.edit {
+                s.tab = tab;
+                self.needs_redraw = true;
+            }
+            return;
+        }
+        // Evict neighbor cache entries immediately so Edit Mode stays strictly within the RAM budget.
+        self.store.enter_edit_mode(&path);
+        self.show_help = false;
+        self.dragging = false;
+        self.next_anim_at = None;
+        self.active_repeat = None;
+        self.compare_via_dock = false;
+
+        let is_anim = img.is_animated();
+        let total_frames = img.frames.len().max(1);
+        let frame_idx = self.frame_index.min(total_frames - 1);
+        self.edit = Some(EditSession::new(tab, is_anim, frame_idx, total_frames));
+        self.update_title(conn);
+        self.update_cursor(conn);
+        self.needs_redraw = true;
+    }
+
+    fn exit_edit_mode(&mut self, conn: &mut Connection<Self>) {
+        self.edit = None;
+        self.compare_via_dock = false;
+        self.active_repeat = None;
+        if let Some(ref img) = self.current_image
+            && img.is_animated()
+        {
+            let delay = img
+                .frames
+                .get(self.frame_index)
+                .map(|f| f.delay_ms)
+                .unwrap_or(0);
+            if delay > 0 {
+                self.next_anim_at = Some(Instant::now() + Duration::from_millis(u64::from(delay)));
+            }
+        }
+        self.update_title(conn);
+        self.update_cursor(conn);
+        self.needs_redraw = true;
+    }
+
+    fn edit_geometry(&self, session: &EditSession) -> Option<(DockLayout, Rect, (u32, u32))> {
+        let img = self.current_image.as_ref()?;
+        let (pw, ph) = self.physical_size();
+        let scale = self.scale_f32();
+        let layout = DockLayout::compute(pw, ph, scale, session);
+        let src = (img.source_width, img.source_height);
+        let oriented = if session.comparing_original {
+            src
+        } else {
+            session.recipe().oriented_dims(src.0, src.1)
+        };
+        let (image_dest, _) =
+            edit_image_dest_rect(oriented, (pw, ph), layout.reserved_bottom_px, scale);
+        Some((layout, image_dest, src))
+    }
+
+    fn request_smart_save(&mut self, conn: &mut Connection<Self>) {
+        let Some(ref path) = self.focused_path else {
+            return;
+        };
+        let (is_dirty, is_anim, orient_only, exporting) = match self.edit.as_ref() {
+            Some(s) => (
+                s.is_dirty(),
+                s.is_animated_source,
+                s.recipe().is_orientation_only(),
+                s.exporting,
+            ),
+            None => return,
+        };
+        if exporting {
+            return;
+        }
+        if !is_dirty {
+            self.show_toast("No changes to save");
+            return;
+        }
+        // Animated or read-only formats always save as a copy.
+        if is_anim || !supports_in_place_overwrite(path, is_anim) {
+            self.start_export(conn, true);
+            return;
+        }
+        // Orient-only JPEG uses instant lossless EXIF tag patch in-place.
+        if orient_only && ImageFormat::from_path(path) == Some(ImageFormat::Jpeg) {
+            self.start_export(conn, false);
+            return;
+        }
+        // Pixel edits (crop/tone/non-JPEG): show non-modal inline Save Choice bar.
+        if let Some(ref mut s) = self.edit {
+            s.prompt = EditPrompt::SaveChoice;
+            self.needs_redraw = true;
+        }
+    }
+
+    fn start_export(&mut self, _conn: &mut Connection<Self>, save_copy: bool) {
+        let Some(path) = self.focused_path.clone() else {
+            return;
+        };
+        let (recipe, quality, frame_index) = match self.edit.as_mut() {
+            Some(s) => {
+                if s.exporting {
+                    return;
+                }
+                if !s.is_dirty() {
+                    self.show_toast("No changes to save");
+                    return;
+                }
+                s.prompt = EditPrompt::None;
+                s.exporting = true;
+                (s.recipe(), s.quality.quality(), s.frame_index)
+            }
+            None => return,
+        };
+
+        // Trim store cache right before full-res export to keep transient peak RAM minimal.
+        self.store.trim_for_export();
+        self.show_toast("Saving…");
+
+        let out_slot = Arc::clone(&self.export_result);
+        let wake = Arc::clone(&self.wake_notify);
+        std::thread::spawn(move || {
+            let res = export_image(
+                &path,
+                &recipe,
+                ExportOptions {
+                    jpeg_quality: quality,
+                    save_copy,
+                    format_override: None,
+                },
+                frame_index,
+            );
+            if let Ok(mut guard) = out_slot.lock() {
+                *guard = Some(ExportOutcome {
+                    save_copy,
+                    result: res,
+                });
+            }
+            wake();
+        });
+    }
+
+    fn start_clipboard_copy(&mut self) {
+        let Some(path) = self.focused_path.clone() else {
+            return;
+        };
+        let (recipe, frame_index) = match self.edit.as_ref() {
+            Some(s) => (s.recipe(), s.frame_index),
+            None => (Default::default(), self.frame_index),
+        };
+        self.show_toast("Copying…");
+
+        let out_slot = Arc::clone(&self.clipboard_result);
+        let wake = Arc::clone(&self.wake_notify);
+        std::thread::spawn(move || {
+            let result = render_edited_image(&path, &recipe, frame_index)
+                .map_err(|e| e.to_string())
+                .and_then(|img| encode_png_bytes(&img, 0).map_err(|e| e.to_string()));
+            if let Ok(mut guard) = out_slot.lock() {
+                *guard = Some(result);
+            }
+            wake();
+        });
+    }
+
+    fn install_clipboard_png(&mut self, conn: &mut Connection<Self>, png_bytes: Vec<u8>) {
+        let (Some(mgr), Some(dev)) = (self.data_device_mgr, self.data_device) else {
+            self.show_toast("Clipboard unavailable");
+            return;
+        };
+        if let Some(old) = self.clipboard_source.take() {
+            old.destroy(conn);
+        }
+        if let Ok(mut guard) = self.clipboard_png.lock() {
+            *guard = Some(png_bytes);
+        }
+        let source = mgr.create_data_source_with_cb(conn, wl_data_source_cb);
+        source.offer(conn, c"image/png".into());
+        dev.set_selection(conn, Some(source), self.last_input_serial);
+        self.clipboard_source = Some(source);
+        self.show_toast("Copied image");
+    }
+
+    fn launch_kapix(&mut self) {
+        let Some(ref path) = self.focused_path else {
+            return;
+        };
+        match std::process::Command::new("kapix").arg(path).spawn() {
+            Ok(_) => self.show_toast("Opened in Kapix"),
+            Err(_) => self.show_toast("Kapix not found in PATH"),
+        }
+    }
+
+    fn handle_edit_action(&mut self, conn: &mut Connection<Self>, action: EditAction) {
+        let Some(src) = self.source_size() else {
+            return;
+        };
+        let prompt = match self.edit.as_ref() {
+            Some(s) => s.prompt,
+            None => return,
+        };
+
+        // When an inline confirmation prompt is open, handle prompt keys first.
+        if prompt != EditPrompt::None {
+            match action {
+                EditAction::ConfirmPrimary => {
+                    self.start_export(conn, true);
+                    return;
+                }
+                EditAction::ConfirmOverwrite if prompt == EditPrompt::SaveChoice => {
+                    self.start_export(conn, false);
+                    return;
+                }
+                EditAction::ConfirmDiscard if prompt == EditPrompt::UnsavedExit => {
+                    self.exit_edit_mode(conn);
+                    return;
+                }
+                EditAction::ExitOrCancel => {
+                    if let Some(ref mut s) = self.edit {
+                        s.prompt = EditPrompt::None;
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                EditAction::CloseWindow => {
+                    self.should_exit = true;
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        match action {
+            EditAction::TabCrop => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Crop;
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::TabAdjust => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Adjust;
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::RotateCw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_cw();
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::RotateCcw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_ccw();
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::FlipH => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_h();
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::FlipV => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_v();
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::SwapAspect => {
+                if let Some(ref mut s) = self.edit {
+                    s.swap_aspect(src.0, src.1);
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::ToggleMonochrome => {
+                if let Some(ref mut s) = self.edit {
+                    s.toggle_monochrome();
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::NudgeCrop(dx, dy, resize) => {
+                if let Some(ref mut s) = self.edit {
+                    s.nudge_crop(dx, dy, resize, src.0, src.1);
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::Undo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.undo().is_some()
+                {
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::Redo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.redo().is_some()
+                {
+                    self.needs_redraw = true;
+                }
+            }
+            EditAction::ResetAll => {
+                if let Some(ref mut s) = self.edit {
+                    s.reset_all();
+                    self.show_toast("Reset edits");
+                }
+            }
+            EditAction::CopyEdited => {
+                self.start_clipboard_copy();
+            }
+            EditAction::SmartSave => {
+                self.request_smart_save(conn);
+            }
+            EditAction::SaveCopy => {
+                self.start_export(conn, true);
+            }
+            EditAction::ConfirmPrimary => {
+                self.request_smart_save(conn);
+            }
+            EditAction::ConfirmOverwrite | EditAction::ConfirmDiscard => {}
+            EditAction::EditInKapix => {
+                self.launch_kapix();
+            }
+            EditAction::ExitOrCancel => {
+                let is_dirty = self.edit.as_ref().is_some_and(EditSession::is_dirty);
+                if is_dirty {
+                    if let Some(ref mut s) = self.edit {
+                        s.prompt = EditPrompt::UnsavedExit;
+                        self.needs_redraw = true;
+                    }
+                } else {
+                    self.exit_edit_mode(conn);
+                }
+            }
+            EditAction::CloseWindow => {
+                self.should_exit = true;
+            }
+        }
+    }
+
+    fn handle_dock_button(
+        &mut self,
+        conn: &mut Connection<Self>,
+        button: DockButton,
+        phys: (f32, f32),
+        layout: &DockLayout,
+        src: (u32, u32),
+    ) {
+        let scale = self.scale_f32();
+        match button {
+            DockButton::TabCrop => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Crop;
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::TabAdjust => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Adjust;
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::Aspect(preset) => {
+                if let Some(ref mut s) = self.edit {
+                    s.set_aspect(preset, src.0, src.1);
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::SwapAspect => {
+                if let Some(ref mut s) = self.edit {
+                    s.swap_aspect(src.0, src.1);
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::RotateCcw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_ccw();
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::RotateCw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_cw();
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::FlipH => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_h();
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::FlipV => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_v();
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::Slider(slider) => {
+                let now = Instant::now();
+                let is_double = self.last_slider_click.is_some_and(|(t, prev)| {
+                    prev == slider && now.duration_since(t) <= DOUBLE_CLICK_MAX_GAP
+                });
+                if is_double {
+                    self.last_slider_click = None;
+                    if let Some(ref mut s) = self.edit {
+                        let mut r = s.recipe();
+                        r.tone.set(slider, 0.0);
+                        s.history.push(r);
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                self.last_slider_click = Some((now, slider));
+                if let (Some(ref mut s), Some(rect)) = (
+                    self.edit.as_mut(),
+                    layout.rect_of(DockButton::Slider(slider)),
+                ) {
+                    let start_recipe = s.recipe();
+                    let val = DockLayout::slider_value_at(rect, scale, phys.0);
+                    s.drag = Some(EditDrag::Slider {
+                        slider,
+                        start_recipe,
+                    });
+                    s.history.current_mut().tone.set(slider, val);
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::Monochrome => {
+                if let Some(ref mut s) = self.edit {
+                    s.toggle_monochrome();
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::Reset => {
+                if let Some(ref mut s) = self.edit {
+                    s.reset_all();
+                    self.show_toast("Reset edits");
+                }
+            }
+            DockButton::Compare => {
+                if let Some(ref mut s) = self.edit {
+                    s.comparing_original = true;
+                    self.compare_via_dock = true;
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::Undo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.undo().is_some()
+                {
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::Redo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.redo().is_some()
+                {
+                    self.needs_redraw = true;
+                }
+            }
+            DockButton::QualityCycle => {
+                if let Some(ref mut s) = self.edit {
+                    s.quality = s.quality.cycle();
+                    let label = format!("JPEG quality {}", s.quality.quality());
+                    self.show_toast(label);
+                }
+            }
+            DockButton::CopyEdited => {
+                self.start_clipboard_copy();
+            }
+            DockButton::SaveOverwrite => {
+                self.request_smart_save(conn);
+            }
+            DockButton::SaveCopy => {
+                self.start_export(conn, true);
+            }
+            DockButton::Done => {
+                self.handle_edit_action(conn, EditAction::ExitOrCancel);
+            }
+            DockButton::PromptSaveCopy => {
+                self.start_export(conn, true);
+            }
+            DockButton::PromptOverwrite => {
+                self.start_export(conn, false);
+            }
+            DockButton::PromptDiscard => {
+                self.exit_edit_mode(conn);
+            }
+            DockButton::PromptCancel => {
+                if let Some(ref mut s) = self.edit {
+                    s.prompt = EditPrompt::None;
+                    self.needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    fn handle_edit_pointer_motion(&mut self, conn: &mut Connection<Self>) {
+        let phys = self.pointer_pos_physical();
+        let scale = self.scale_f32();
+        let shift_held = self.mods.shift;
+
+        let Some(session_snap) = self.edit.as_ref() else {
+            return;
+        };
+        let Some((layout, image_dest, src)) = self.edit_geometry(session_snap) else {
+            return;
+        };
+
+        let Some(ref mut session) = self.edit else {
+            return;
+        };
+
+        if let Some(drag) = session.drag {
+            match drag {
+                EditDrag::Slider { slider, .. } => {
+                    if let Some(rect) = layout.rect_of(DockButton::Slider(slider)) {
+                        let val = DockLayout::slider_value_at(rect, scale, phys.0);
+                        session.history.current_mut().tone.set(slider, val);
+                        self.needs_redraw = true;
+                    }
+                }
+                EditDrag::CropHandle {
+                    handle,
+                    start_recipe,
+                    start_norm,
+                } => {
+                    if image_dest.w > 1.0 && image_dest.h > 1.0 {
+                        let cur_u = (phys.0 - image_dest.x) / image_dest.w;
+                        let cur_v = (phys.1 - image_dest.y) / image_dest.h;
+                        let dx = cur_u - start_norm.0;
+                        let dy = cur_v - start_norm.1;
+                        let (ow, oh) = start_recipe.oriented_dims(src.0, src.1);
+                        let locked = session.effective_aspect_ratio(src.0, src.1, shift_held);
+                        let next_crop =
+                            start_recipe.crop.apply_drag(handle, dx, dy, locked, ow, oh);
+                        session.history.current_mut().crop = next_crop;
+                        self.needs_redraw = true;
+                    }
+                }
+                EditDrag::NewCrop {
+                    start_recipe,
+                    anchor_norm,
+                } => {
+                    if image_dest.w > 1.0 && image_dest.h > 1.0 {
+                        let cur_u = ((phys.0 - image_dest.x) / image_dest.w).clamp(0.0, 1.0);
+                        let cur_v = ((phys.1 - image_dest.y) / image_dest.h).clamp(0.0, 1.0);
+                        let x0 = anchor_norm.0.min(cur_u);
+                        let y0 = anchor_norm.1.min(cur_v);
+                        let w = (cur_u - anchor_norm.0).abs();
+                        let h = (cur_v - anchor_norm.1).abs();
+                        let (ow, oh) = start_recipe.oriented_dims(src.0, src.1);
+                        let (min_w, min_h) = CropRect::min_norm_for(ow, oh);
+                        let mut rect = CropRect { x: x0, y: y0, w, h }.clamped(min_w, min_h);
+                        if let Some(ratio) =
+                            session.effective_aspect_ratio(src.0, src.1, shift_held)
+                        {
+                            rect = rect.fit_aspect(ratio, ow, oh);
+                        }
+                        session.history.current_mut().crop = rect;
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Hover hit-testing for dock buttons and crop handles.
+        let hovered_btn = layout.hit_test(phys);
+        let hovered_handle = if hovered_btn.is_none()
+            && !layout.contains_point(phys)
+            && session.prompt == EditPrompt::None
+        {
+            let crop_screen = session.recipe().crop.to_screen_rect(image_dest);
+            hit_test_crop(phys, crop_screen, 10.0 * scale)
+        } else {
+            None
+        };
+
+        if hovered_btn != session.hovered_button || hovered_handle != session.hovered_handle {
+            session.hovered_button = hovered_btn;
+            session.hovered_handle = hovered_handle;
+            self.needs_redraw = true;
+            self.update_cursor(conn);
+        }
+    }
+
+    fn handle_edit_pointer_button(&mut self, conn: &mut Connection<Self>, pressed: bool) {
+        let phys = self.pointer_pos_physical();
+        let scale = self.scale_f32();
+
+        if !pressed {
+            if self.compare_via_dock {
+                self.compare_via_dock = false;
+                if let Some(ref mut s) = self.edit {
+                    s.comparing_original = false;
+                    self.needs_redraw = true;
+                }
+            }
+            if let Some(ref mut s) = self.edit
+                && let Some(drag) = s.drag.take()
+            {
+                let start_recipe = match drag {
+                    EditDrag::CropHandle { start_recipe, .. }
+                    | EditDrag::NewCrop { start_recipe, .. }
+                    | EditDrag::Slider { start_recipe, .. } => start_recipe,
+                };
+                let after = s.recipe();
+                s.history.commit_from(start_recipe, after);
+                self.needs_redraw = true;
+                self.update_cursor(conn);
+            }
+            return;
+        }
+
+        let Some(session_snap) = self.edit.as_ref() else {
+            return;
+        };
+        let Some((layout, image_dest, src)) = self.edit_geometry(session_snap) else {
+            return;
+        };
+
+        if let Some(btn) = layout.hit_test(phys) {
+            self.handle_dock_button(conn, btn, phys, &layout, src);
+            self.update_cursor(conn);
+            return;
+        }
+
+        if layout.contains_point(phys) {
+            return;
+        }
+
+        if let Some(ref mut s) = self.edit {
+            if s.prompt != EditPrompt::None {
+                // Clicking canvas outside prompt dismisses the inline prompt cleanly.
+                s.prompt = EditPrompt::None;
+                self.needs_redraw = true;
+                return;
+            }
+
+            let crop_screen = s.recipe().crop.to_screen_rect(image_dest);
+            if let Some(handle) = hit_test_crop(phys, crop_screen, 10.0 * scale) {
+                let start_norm = (
+                    (phys.0 - image_dest.x) / image_dest.w.max(1.0),
+                    (phys.1 - image_dest.y) / image_dest.h.max(1.0),
+                );
+                let start_recipe = s.recipe();
+                s.drag = Some(EditDrag::CropHandle {
+                    handle,
+                    start_recipe,
+                    start_norm,
+                });
+                self.needs_redraw = true;
+                self.update_cursor(conn);
+            } else if phys.0 >= image_dest.x
+                && phys.0 <= image_dest.x + image_dest.w
+                && phys.1 >= image_dest.y
+                && phys.1 <= image_dest.y + image_dest.h
+            {
+                let anchor_norm = (
+                    ((phys.0 - image_dest.x) / image_dest.w.max(1.0)).clamp(0.0, 1.0),
+                    ((phys.1 - image_dest.y) / image_dest.h.max(1.0)).clamp(0.0, 1.0),
+                );
+                let start_recipe = s.recipe();
+                s.drag = Some(EditDrag::NewCrop {
+                    start_recipe,
+                    anchor_norm,
+                });
+                self.needs_redraw = true;
+                self.update_cursor(conn);
+            }
+        }
+    }
+
     fn drain_async_events(&mut self, conn: &mut Connection<Self>) {
         // 1. Drain dropped file from drag-and-drop
         let dropped = self.drop_result.lock().ok().and_then(|mut g| g.take());
@@ -446,12 +1201,64 @@ impl WaylandApp {
             let focused = pl.current().to_path_buf();
             self.playlist = Some(pl);
             self.update_title(conn);
-            if self.focused_path.as_deref() == Some(focused.as_path()) {
+            if self.edit.is_none() && self.focused_path.as_deref() == Some(focused.as_path()) {
                 let _ = self.store.focus(&focused, &neighbors, self.decode_target);
             }
         }
 
-        // 3. Drain decoded image events from ImageStore
+        // 3. Drain Edit Mode export completion
+        let exported = self.export_result.lock().ok().and_then(|mut g| g.take());
+        if let Some(outcome) = exported {
+            match outcome.result {
+                Ok(res) => {
+                    let saved_path = res.saved_path.clone();
+                    let fname = saved_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| saved_path.to_string_lossy().into_owned());
+                    let msg = if res.lossless {
+                        "Saved lossless".to_string()
+                    } else if res.redirected_to_copy {
+                        format!("Saved copy: {fname}")
+                    } else if outcome.save_copy {
+                        format!("Saved {fname}")
+                    } else {
+                        "Saved".to_string()
+                    };
+
+                    self.exit_edit_mode(conn);
+                    if outcome.save_copy || res.redirected_to_copy {
+                        if let Some(ref mut pl) = self.playlist {
+                            pl.insert_and_select(saved_path.clone());
+                        } else {
+                            self.playlist = Some(Playlist::single(saved_path.clone()));
+                        }
+                    } else {
+                        // In-place overwrite: clear cached entry so we reload the newly saved file.
+                        self.store.trim_for_export();
+                    }
+                    self.open_file(conn, saved_path, false);
+                    self.show_toast(msg);
+                }
+                Err(err) => {
+                    if let Some(ref mut s) = self.edit {
+                        s.exporting = false;
+                    }
+                    self.show_toast(err.to_string());
+                }
+            }
+        }
+
+        // 4. Drain clipboard PNG render completion
+        let clip = self.clipboard_result.lock().ok().and_then(|mut g| g.take());
+        if let Some(res) = clip {
+            match res {
+                Ok(png_bytes) => self.install_clipboard_png(conn, png_bytes),
+                Err(err) => self.show_toast(format!("Copy failed: {err}")),
+            }
+        }
+
+        // 5. Drain decoded image events from ImageStore
         for ev in self.store.poll() {
             match ev {
                 StoreEvent::Ready {
@@ -590,19 +1397,33 @@ impl WaylandApp {
             Action::Close => {
                 self.should_exit = true;
             }
-            Action::RotateCw
-            | Action::RotateCcw
-            | Action::ToggleInfo
-            | Action::Delete
-            | Action::CopyImage
-            | Action::CopyPath
-            | Action::EditInKapix => {
-                self.show_toast("Coming in v0.2");
+            Action::EditMode | Action::CropMode => {
+                self.enter_edit_mode(conn, EditTab::Crop);
+            }
+            Action::RotateCw => {
+                self.enter_edit_mode(conn, EditTab::Crop);
+                self.handle_edit_action(conn, EditAction::RotateCw);
+            }
+            Action::RotateCcw => {
+                self.enter_edit_mode(conn, EditTab::Crop);
+                self.handle_edit_action(conn, EditAction::RotateCcw);
+            }
+            Action::CopyImage => {
+                self.start_clipboard_copy();
+            }
+            Action::EditInKapix => {
+                self.launch_kapix();
+            }
+            Action::ToggleInfo | Action::Delete | Action::CopyPath => {
+                self.show_toast("Coming in v0.4");
             }
         }
     }
 
     fn apply_scroll_zoom(&mut self, conn: &mut Connection<Self>, steps: f32) {
+        if self.edit.is_some() {
+            return;
+        }
         let Some(src) = self.source_size() else {
             return;
         };
@@ -631,7 +1452,9 @@ impl WaylandApp {
         if let Some(anim_at) = self.next_anim_at
             && now >= anim_at
         {
-            if let Some(ref img) = self.current_image
+            if self.edit.is_some() {
+                self.next_anim_at = None;
+            } else if let Some(ref img) = self.current_image
                 && img.is_animated()
             {
                 let next_idx = self.frame_index + 1;
@@ -661,7 +1484,13 @@ impl WaylandApp {
         {
             let keycode = rep.keycode;
             rep.next_at = now + rep.interval;
-            if let Some(action) = action_for_linux_evdev(keycode, self.mods)
+            if self.edit.is_some() {
+                if let Some(action) = edit_action_for_linux_evdev(keycode, self.mods)
+                    && matches!(action, EditAction::NudgeCrop(_, _, _))
+                {
+                    self.handle_edit_action(conn, action);
+                }
+            } else if let Some(action) = action_for_linux_evdev(keycode, self.mods)
                 && matches!(
                     action,
                     Action::Next | Action::Prev | Action::ZoomIn | Action::ZoomOut
@@ -728,7 +1557,44 @@ impl WaylandApp {
         let mut canvas = Canvas::new(pw, ph, pixels);
         canvas.clear(self.palette.bg);
 
-        if let Some(ref img) = self.current_image {
+        if let (Some(session), Some(img)) = (self.edit.as_ref(), self.current_image.as_ref()) {
+            let src = (img.source_width, img.source_height);
+            let layout = DockLayout::compute(pw, ph, scale, session);
+            let recipe = session.recipe();
+            let (turns, flip_h, flip_v, oriented) = if session.comparing_original {
+                (QuarterTurns::R0, false, false, src)
+            } else {
+                (
+                    recipe.turns,
+                    recipe.flip_h,
+                    recipe.flip_v,
+                    recipe.oriented_dims(src.0, src.1),
+                )
+            };
+            let (dest, img_scale) =
+                edit_image_dest_rect(oriented, (pw, ph), layout.reserved_bottom_px, scale);
+            let lut = session.preview_lut();
+            canvas.draw_image_edited(
+                img,
+                session.frame_index,
+                dest,
+                img_scale,
+                turns,
+                flip_h,
+                flip_v,
+                &lut,
+            );
+            draw_edit_ui(
+                &mut canvas,
+                &mut self.overlay,
+                scale,
+                self.palette,
+                dest,
+                src,
+                session,
+                &layout,
+            );
+        } else if let Some(ref img) = self.current_image {
             let src = (img.source_width, img.source_height);
             let dest = self.view.dest_rect(src, (pw, ph));
             canvas.draw_image(img, self.frame_index, dest, self.view.scale);
@@ -739,7 +1605,7 @@ impl WaylandApp {
             error: self.error.as_ref(),
             loading_label: self.loading_label.as_deref(),
             toast: self.toast.as_deref(),
-            show_help: self.show_help,
+            show_help: self.show_help && self.edit.is_none(),
         };
         self.overlay.draw(&mut canvas, scale, self.palette, &ov);
 
@@ -917,7 +1783,10 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         _fractional_scale: fractional_scale,
         cursor_shape_mgr,
         cursor_shape_dev: None,
-        _data_device: data_device,
+        data_device_mgr,
+        data_device,
+        clipboard_source: None,
+        clipboard_png: Arc::new(Mutex::new(None)),
         keyboard: None,
         pointer: None,
         frame_cb: None,
@@ -951,6 +1820,12 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         view: initial_view,
         full_res_requested: false,
 
+        edit: None,
+        export_result: Arc::new(Mutex::new(None)),
+        clipboard_result: Arc::new(Mutex::new(None)),
+        last_slider_click: None,
+        compare_via_dock: false,
+
         frame_index: 0,
         loops_completed: 0,
         next_anim_at: None,
@@ -961,12 +1836,13 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         active_repeat: None,
         pointer_pos_logical: (0.0, 0.0),
         pointer_enter_serial: 0,
+        last_input_serial: 0,
         dragging: false,
         last_drag_phys: (0.0, 0.0),
         last_left_click: None,
         scroll_v120_accum: 0,
         scroll_px_accum: 0.0,
-        last_cursor_grab: 0,
+        last_cursor_shape: 0,
 
         dnd_offers: Vec::new(),
         active_dnd_offer: None,
@@ -1041,6 +1917,9 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         }
     }
 
+    if let Some(src) = state.clipboard_source.take() {
+        src.destroy(&mut conn);
+    }
     state.swapchain.destroy_all(&mut conn);
     let _ = conn.flush(IoMode::Blocking);
     state.exit_code
@@ -1150,6 +2029,13 @@ fn wl_keyboard_cb(ctx: EventCtx<WaylandApp, WlKeyboard>) {
         wl_keyboard::Event::Leave(_) => {
             ctx.state.mods = Modifiers::default();
             ctx.state.active_repeat = None;
+            if let Some(ref mut s) = ctx.state.edit
+                && s.comparing_original
+                && !ctx.state.compare_via_dock
+            {
+                s.comparing_original = false;
+                ctx.state.needs_redraw = true;
+            }
         }
         wl_keyboard::Event::Modifiers(args) => {
             // Standard XKB modifier bitmask: bit 0 = Shift, bit 2 = Control, bit 3 = Mod1 (Alt).
@@ -1163,11 +2049,56 @@ fn wl_keyboard_cb(ctx: EventCtx<WaylandApp, WlKeyboard>) {
         }
         wl_keyboard::Event::Key(args) => {
             let pressed = args.state == wl_keyboard::KeyState::Pressed;
+            if pressed {
+                ctx.state.last_input_serial = args.serial;
+            }
             match args.key {
                 KEY_LEFTSHIFT | KEY_RIGHTSHIFT => ctx.state.mods.shift = pressed,
                 KEY_LEFTCTRL | KEY_RIGHTCTRL => ctx.state.mods.ctrl = pressed,
                 KEY_LEFTALT | KEY_RIGHTALT => ctx.state.mods.alt = pressed,
                 _ => {}
+            }
+
+            if ctx.state.edit.is_some() {
+                // Hold `\` to compare original while in Edit Mode.
+                if args.key == EVDEV_KEY_COMPARE {
+                    if let Some(ref mut s) = ctx.state.edit
+                        && s.comparing_original != pressed
+                    {
+                        s.comparing_original = pressed;
+                        ctx.state.needs_redraw = true;
+                    }
+                    return;
+                }
+                if pressed {
+                    if let Some(action) = edit_action_for_linux_evdev(args.key, ctx.state.mods) {
+                        ctx.state.handle_edit_action(ctx.conn, action);
+                        if matches!(action, EditAction::NudgeCrop(_, _, _))
+                            && ctx.state.repeat_rate_hz > 0
+                        {
+                            let delay =
+                                Duration::from_millis(ctx.state.repeat_delay_ms.max(100) as u64);
+                            let interval = Duration::from_millis(
+                                (1000 / ctx.state.repeat_rate_hz.max(1)) as u64,
+                            );
+                            ctx.state.active_repeat = Some(RepeatState {
+                                keycode: args.key,
+                                next_at: Instant::now() + delay,
+                                interval,
+                            });
+                        } else {
+                            ctx.state.active_repeat = None;
+                        }
+                    }
+                } else if ctx
+                    .state
+                    .active_repeat
+                    .as_ref()
+                    .is_some_and(|r| r.keycode == args.key)
+                {
+                    ctx.state.active_repeat = None;
+                }
+                return;
             }
 
             if pressed {
@@ -1209,14 +2140,26 @@ fn wl_pointer_cb(ctx: EventCtx<WaylandApp, WlPointer>) {
         wl_pointer::Event::Enter(args) => {
             ctx.state.pointer_enter_serial = args.serial;
             ctx.state.pointer_pos_logical = (args.surface_x.as_f64(), args.surface_y.as_f64());
-            ctx.state.last_cursor_grab = u8::MAX;
+            ctx.state.last_cursor_shape = u8::MAX;
             ctx.state.update_cursor(ctx.conn);
         }
         wl_pointer::Event::Leave(_) => {
             ctx.state.dragging = false;
+            if let Some(ref mut s) = ctx.state.edit
+                && s.drag.is_none()
+                && (s.hovered_button.is_some() || s.hovered_handle.is_some())
+            {
+                s.hovered_button = None;
+                s.hovered_handle = None;
+                ctx.state.needs_redraw = true;
+            }
         }
         wl_pointer::Event::Motion(args) => {
             ctx.state.pointer_pos_logical = (args.surface_x.as_f64(), args.surface_y.as_f64());
+            if ctx.state.edit.is_some() {
+                ctx.state.handle_edit_pointer_motion(ctx.conn);
+                return;
+            }
             if ctx.state.dragging {
                 let cur = ctx.state.pointer_pos_physical();
                 let dx = cur.0 - ctx.state.last_drag_phys.0;
@@ -1233,6 +2176,15 @@ fn wl_pointer_cb(ctx: EventCtx<WaylandApp, WlPointer>) {
         }
         wl_pointer::Event::Button(args) => {
             let pressed = args.state == wl_pointer::ButtonState::Pressed;
+            if pressed {
+                ctx.state.last_input_serial = args.serial;
+            }
+            if ctx.state.edit.is_some() {
+                if args.button == BTN_LEFT {
+                    ctx.state.handle_edit_pointer_button(ctx.conn, pressed);
+                }
+                return;
+            }
             match args.button {
                 BTN_LEFT => {
                     if pressed {
@@ -1291,6 +2243,32 @@ fn wl_pointer_cb(ctx: EventCtx<WaylandApp, WlPointer>) {
                 ctx.state.scroll_px_accum = 0.0;
                 ctx.state.apply_scroll_zoom(ctx.conn, steps);
             }
+        }
+        _ => {}
+    }
+}
+
+fn wl_data_source_cb(ctx: EventCtx<WaylandApp, WlDataSource>) {
+    match ctx.event {
+        wl_data_source::Event::Send(args) => {
+            if args.mime_type.as_bytes() == b"image/png" {
+                let bytes = ctx.state.clipboard_png.lock().ok().and_then(|g| g.clone());
+                if let Some(data) = bytes {
+                    std::thread::spawn(move || {
+                        let mut f = std::fs::File::from(args.fd);
+                        let _ = f.write_all(&data);
+                    });
+                }
+            }
+        }
+        wl_data_source::Event::Cancelled => {
+            if ctx.state.clipboard_source == Some(ctx.proxy) {
+                ctx.state.clipboard_source = None;
+                if let Ok(mut guard) = ctx.state.clipboard_png.lock() {
+                    *guard = None;
+                }
+            }
+            ctx.proxy.destroy(ctx.conn);
         }
         _ => {}
     }

@@ -7,7 +7,11 @@
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use kalux_core::{Palette, View};
+use kalux_core::edit::edit_image_dest_rect;
+use kalux_core::{
+    AspectPreset, CropRect, DockLayout, EditRecipe, EditSession, EditTab, Palette, ToneAdjustments,
+    View,
+};
 use kalux_decode::decode_file;
 use windows::Win32::Foundation::GENERIC_WRITE;
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -33,6 +37,8 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, STGC_D
 use windows::core::{Interface, PCWSTR, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
+use crate::args::ScreenshotEditMode;
+use crate::edit_ui::EditUiRenderer;
 use crate::overlay::{OverlayRenderer, OverlayView, rgba_to_d2d};
 use crate::render::{choose_interpolation, create_d2d_bitmap};
 
@@ -44,6 +50,7 @@ pub struct ScreenshotOptions {
     pub out: PathBuf,
     pub light: bool,
     pub show_help: bool,
+    pub edit_mode: ScreenshotEditMode,
     pub toast: Option<String>,
     pub title: Option<String>,
     pub width: u32,
@@ -94,16 +101,73 @@ pub fn render_screenshot(opts: &ScreenshotOptions) -> Result<(), String> {
         .frames
         .first()
         .ok_or_else(|| "Decoded image has no frames".to_string())?;
-    let pitch = decoded.width.saturating_mul(4);
-    let d2d_bmp = create_d2d_bitmap(&target, decoded.width, decoded.height, pitch, &frame.pixels)
-        .map_err(|e| format!("Failed to create D2D bitmap: {e}"))?;
-
     let source_dims = (decoded.source_width, decoded.source_height);
     let client_dims = (w, client_h);
-    let view = View::fit(source_dims, client_dims);
-    let dest = view.dest_rect(source_dims, client_dims);
+
+    let edit_state = match opts.edit_mode {
+        ScreenshotEditMode::None => None,
+        ScreenshotEditMode::Crop | ScreenshotEditMode::Adjust => {
+            let tab = if opts.edit_mode == ScreenshotEditMode::Adjust {
+                EditTab::Adjust
+            } else {
+                EditTab::Crop
+            };
+            let mut session = EditSession::new(tab, false, 0, 1);
+            if opts.edit_mode == ScreenshotEditMode::Crop {
+                session.aspect = AspectPreset::ThreeTwo;
+                session.history.push(EditRecipe {
+                    crop: CropRect {
+                        x: 0.14,
+                        y: 0.12,
+                        w: 0.72,
+                        h: 0.74,
+                    },
+                    ..EditRecipe::default()
+                });
+            } else {
+                session.history.push(EditRecipe {
+                    tone: ToneAdjustments {
+                        exposure: 0.18,
+                        contrast: 0.24,
+                        saturation: 0.16,
+                        warmth: 0.22,
+                        monochrome: false,
+                    },
+                    ..EditRecipe::default()
+                });
+            }
+            let layout = DockLayout::compute(w, client_h, 1.0, &session);
+            let oriented = session.recipe().oriented_dims(source_dims.0, source_dims.1);
+            let (dest, img_scale) =
+                edit_image_dest_rect(oriented, client_dims, layout.reserved_bottom_px, 1.0);
+            Some((session, layout, dest, img_scale))
+        }
+    };
+
+    let toned_pixels: Option<Vec<u8>> = edit_state.as_ref().and_then(|(session, _, _, _)| {
+        let lut = session.preview_lut();
+        if lut.is_identity() {
+            None
+        } else {
+            let mut buf = frame.pixels.clone();
+            lut.apply_bgra_premul_slice(&mut buf);
+            Some(buf)
+        }
+    });
+    let upload_pixels = toned_pixels.as_deref().unwrap_or(&frame.pixels);
+    let pitch = decoded.width.saturating_mul(4);
+    let d2d_bmp = create_d2d_bitmap(&target, decoded.width, decoded.height, pitch, upload_pixels)
+        .map_err(|e| format!("Failed to create D2D bitmap: {e}"))?;
+
+    let (dest, img_scale) = if let Some((_, _, d, s)) = edit_state.as_ref() {
+        (*d, *s)
+    } else {
+        let view = View::fit(source_dims, client_dims);
+        (view.dest_rect(source_dims, client_dims), view.scale)
+    };
 
     let mut overlays = OverlayRenderer::default();
+    let mut edit_ui = EditUiRenderer::default();
     let overlay_view = OverlayView {
         empty_hint: false,
         error: None,
@@ -121,8 +185,12 @@ pub fn render_screenshot(opts: &ScreenshotOptions) -> Result<(), String> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| opts.image.to_string_lossy().into_owned());
+        let suffix = match opts.edit_mode {
+            ScreenshotEditMode::None => "",
+            ScreenshotEditMode::Crop | ScreenshotEditMode::Adjust => " — Editing",
+        };
         format!(
-            "{name} — 1 / 12 — {}×{} — Kalux",
+            "{name} — 1 / 12 — {}×{}{suffix} — Kalux",
             decoded.source_width, decoded.source_height
         )
     });
@@ -145,7 +213,7 @@ pub fn render_screenshot(opts: &ScreenshotOptions) -> Result<(), String> {
         bottom: dest.y + dest.h,
     };
     if let Some(dc_ref) = dc.as_ref() {
-        let mode = choose_interpolation(dest, (decoded.width, decoded.height), view.scale);
+        let mode = choose_interpolation(dest, (decoded.width, decoded.height), img_scale);
         // SAFETY: `dc_ref` is the same target via QI inside BeginDraw..EndDraw.
         unsafe { dc_ref.DrawBitmap(&d2d_bmp, Some(&d2d_rect), 1.0, mode, None, None) };
     } else {
@@ -159,6 +227,19 @@ pub fn render_screenshot(opts: &ScreenshotOptions) -> Result<(), String> {
                 None,
             );
         }
+    }
+
+    if let Some((ref session, ref layout, edit_dest, _)) = edit_state {
+        edit_ui.draw(
+            &target,
+            client_dims,
+            1.0,
+            palette,
+            edit_dest,
+            source_dims,
+            session,
+            layout,
+        );
     }
 
     overlays.draw(&target, client_dims, 96, palette, &overlay_view);

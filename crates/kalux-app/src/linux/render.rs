@@ -3,7 +3,7 @@
 //! Wayland `wl_shm::Format::Argb8888` on little-endian architectures is `[B, G, R, A]` in memory —
 //! the exact same byte layout as `kalux_core::DecodedImage`, so there is zero channel swizzling.
 
-use kalux_core::{DecodedImage, Palette, Rect, Rgba};
+use kalux_core::{DecodedImage, Palette, QuarterTurns, Rect, Rgba, ToneLut};
 
 /// Borrowed BGRA8 premultiplied pixel canvas (`width * height * 4` bytes).
 pub struct Canvas<'a> {
@@ -316,6 +316,252 @@ impl<'a> Canvas<'a> {
                     sampled[c] = ((v + 32_768) >> 16) as u8;
                 }
                 blend_premul_over(sampled, d);
+            }
+        }
+    }
+
+    /// Blit a premultiplied BGRA8 `DecodedImage` frame with live Edit Mode orientation (`turns`,
+    /// `flip_h`, `flip_v`) and inline [`ToneLut`] color grading — allocating **0 extra image bytes**.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_image_edited(
+        &mut self,
+        image: &DecodedImage,
+        frame_idx: usize,
+        dest: Rect,
+        scale: f32,
+        turns: QuarterTurns,
+        flip_h: bool,
+        flip_v: bool,
+        lut: &ToneLut,
+    ) {
+        if turns == QuarterTurns::R0 && !flip_h && !flip_v && lut.is_identity() {
+            self.draw_image(image, frame_idx, dest, scale);
+            return;
+        }
+        if image.frames.is_empty() || image.width == 0 || image.height == 0 {
+            return;
+        }
+        let frame = &image.frames[frame_idx.min(image.frames.len() - 1)];
+        let sw = image.width as usize;
+        let sh = image.height as usize;
+        if frame.pixels.len() < sw * sh * 4 || dest.w <= 0.0 || dest.h <= 0.0 {
+            return;
+        }
+
+        let dst_w = self.width as i32;
+        let dst_h = self.height as i32;
+        let x0 = (dest.x.floor() as i32).max(0);
+        let y0 = (dest.y.floor() as i32).max(0);
+        let x1 = ((dest.x + dest.w).ceil() as i32).min(dst_w);
+        let y1 = ((dest.y + dest.h).ceil() as i32).min(dst_h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let src = &frame.pixels;
+        let cw = self.width as usize;
+        let row_stride = sw * 4;
+        let span_w = (x1 - x0) as usize;
+        let inv_dw = 1.0 / dest.w;
+        let inv_dh = 1.0 / dest.h;
+        let max_sx = (sw - 1) as f32;
+        let max_sy = (sh - 1) as f32;
+        let nearest = scale >= 3.0;
+        let apply_lut = !lut.is_identity();
+
+        if !turns.swaps_axes() {
+            let rev_x = flip_h ^ (turns == QuarterTurns::R180);
+            let rev_y = flip_v ^ (turns == QuarterTurns::R180);
+
+            if nearest {
+                let mut sx_lut = Vec::with_capacity(span_w);
+                for x in x0..x1 {
+                    let u = (((x as f32 + 0.5) - dest.x) * inv_dw).clamp(0.0, 1.0);
+                    let su = if rev_x { 1.0 - u } else { u };
+                    let sx = ((su * sw as f32).floor() as isize).clamp(0, sw as isize - 1) as usize;
+                    sx_lut.push(sx * 4);
+                }
+                for y in y0..y1 {
+                    let v = (((y as f32 + 0.5) - dest.y) * inv_dh).clamp(0.0, 1.0);
+                    let sv = if rev_y { 1.0 - v } else { v };
+                    let sy = ((sv * sh as f32).floor() as isize).clamp(0, sh as isize - 1) as usize;
+                    let s_row = &src[sy * row_stride..(sy + 1) * row_stride];
+                    let d_off = ((y as usize) * cw + (x0 as usize)) * 4;
+                    let d_row = &mut self.pixels[d_off..d_off + span_w * 4];
+                    for (&o, d) in sx_lut.iter().zip(d_row.as_chunks_mut::<4>().0.iter_mut()) {
+                        let mut sampled = [s_row[o], s_row[o + 1], s_row[o + 2], s_row[o + 3]];
+                        if apply_lut {
+                            sampled = lut.apply_bgra_premul(sampled);
+                        }
+                        blend_premul_over(sampled, d);
+                    }
+                }
+            } else {
+                let mut x_table: Vec<(usize, usize, u32)> = Vec::with_capacity(span_w);
+                for x in x0..x1 {
+                    let u = (((x as f32 + 0.5) - dest.x) * inv_dw).clamp(0.0, 1.0);
+                    let su = if rev_x { 1.0 - u } else { u };
+                    let fx = (su * sw as f32 - 0.5).clamp(0.0, max_sx);
+                    let ix0 = fx.floor() as usize;
+                    let ix1 = (ix0 + 1).min(sw - 1);
+                    let wx = (((fx - ix0 as f32) * 256.0 + 0.5) as u32).min(256);
+                    x_table.push((ix0 * 4, ix1 * 4, wx));
+                }
+                for y in y0..y1 {
+                    let v = (((y as f32 + 0.5) - dest.y) * inv_dh).clamp(0.0, 1.0);
+                    let sv = if rev_y { 1.0 - v } else { v };
+                    let fy = (sv * sh as f32 - 0.5).clamp(0.0, max_sy);
+                    let iy0 = fy.floor() as usize;
+                    let iy1 = (iy0 + 1).min(sh - 1);
+                    let wy = (((fy - iy0 as f32) * 256.0 + 0.5) as u32).min(256);
+                    let inv_wy = 256 - wy;
+
+                    let row0 = &src[iy0 * row_stride..(iy0 + 1) * row_stride];
+                    let row1 = &src[iy1 * row_stride..(iy1 + 1) * row_stride];
+                    let d_off = ((y as usize) * cw + (x0 as usize)) * 4;
+                    let d_row = &mut self.pixels[d_off..d_off + span_w * 4];
+
+                    for (&(o0, o1, wx), d) in
+                        x_table.iter().zip(d_row.as_chunks_mut::<4>().0.iter_mut())
+                    {
+                        let inv_wx = 256 - wx;
+                        let w00 = inv_wx * inv_wy;
+                        let w10 = wx * inv_wy;
+                        let w01 = inv_wx * wy;
+                        let w11 = wx * wy;
+                        let mut sampled = [
+                            ((u32::from(row0[o0]) * w00
+                                + u32::from(row0[o1]) * w10
+                                + u32::from(row1[o0]) * w01
+                                + u32::from(row1[o1]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                            ((u32::from(row0[o0 + 1]) * w00
+                                + u32::from(row0[o1 + 1]) * w10
+                                + u32::from(row1[o0 + 1]) * w01
+                                + u32::from(row1[o1 + 1]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                            ((u32::from(row0[o0 + 2]) * w00
+                                + u32::from(row0[o1 + 2]) * w10
+                                + u32::from(row1[o0 + 2]) * w01
+                                + u32::from(row1[o1 + 2]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                            ((u32::from(row0[o0 + 3]) * w00
+                                + u32::from(row0[o1 + 3]) * w10
+                                + u32::from(row1[o0 + 3]) * w01
+                                + u32::from(row1[o1 + 3]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                        ];
+                        if apply_lut {
+                            sampled = lut.apply_bgra_premul(sampled);
+                        }
+                        blend_premul_over(sampled, d);
+                    }
+                }
+            }
+        } else {
+            // R90: (su, sv) = (v1, 1 - u1); R270: (su, sv) = (1 - v1, u1)
+            let rev_sv_from_x = flip_h ^ (turns == QuarterTurns::R90);
+            let rev_su_from_y = flip_v ^ (turns == QuarterTurns::R270);
+
+            if nearest {
+                let mut sy_lut = Vec::with_capacity(span_w);
+                for x in x0..x1 {
+                    let u = (((x as f32 + 0.5) - dest.x) * inv_dw).clamp(0.0, 1.0);
+                    let sv = if rev_sv_from_x { 1.0 - u } else { u };
+                    let sy = ((sv * sh as f32).floor() as isize).clamp(0, sh as isize - 1) as usize;
+                    sy_lut.push(sy * row_stride);
+                }
+                for y in y0..y1 {
+                    let v = (((y as f32 + 0.5) - dest.y) * inv_dh).clamp(0.0, 1.0);
+                    let su = if rev_su_from_y { 1.0 - v } else { v };
+                    let sx = ((su * sw as f32).floor() as isize).clamp(0, sw as isize - 1) as usize;
+                    let col_off = sx * 4;
+                    let d_off = ((y as usize) * cw + (x0 as usize)) * 4;
+                    let d_row = &mut self.pixels[d_off..d_off + span_w * 4];
+                    for (&row_off, d) in sy_lut.iter().zip(d_row.as_chunks_mut::<4>().0.iter_mut())
+                    {
+                        let o = row_off + col_off;
+                        let mut sampled = [src[o], src[o + 1], src[o + 2], src[o + 3]];
+                        if apply_lut {
+                            sampled = lut.apply_bgra_premul(sampled);
+                        }
+                        blend_premul_over(sampled, d);
+                    }
+                }
+            } else {
+                let mut y_from_x_table: Vec<(usize, usize, u32)> = Vec::with_capacity(span_w);
+                for x in x0..x1 {
+                    let u = (((x as f32 + 0.5) - dest.x) * inv_dw).clamp(0.0, 1.0);
+                    let sv = if rev_sv_from_x { 1.0 - u } else { u };
+                    let fy = (sv * sh as f32 - 0.5).clamp(0.0, max_sy);
+                    let iy0 = fy.floor() as usize;
+                    let iy1 = (iy0 + 1).min(sh - 1);
+                    let wy = (((fy - iy0 as f32) * 256.0 + 0.5) as u32).min(256);
+                    y_from_x_table.push((iy0 * row_stride, iy1 * row_stride, wy));
+                }
+                for y in y0..y1 {
+                    let v = (((y as f32 + 0.5) - dest.y) * inv_dh).clamp(0.0, 1.0);
+                    let su = if rev_su_from_y { 1.0 - v } else { v };
+                    let fx = (su * sw as f32 - 0.5).clamp(0.0, max_sx);
+                    let ix0 = fx.floor() as usize;
+                    let ix1 = (ix0 + 1).min(sw - 1);
+                    let wx = (((fx - ix0 as f32) * 256.0 + 0.5) as u32).min(256);
+                    let inv_wx = 256 - wx;
+                    let c0 = ix0 * 4;
+                    let c1 = ix1 * 4;
+
+                    let d_off = ((y as usize) * cw + (x0 as usize)) * 4;
+                    let d_row = &mut self.pixels[d_off..d_off + span_w * 4];
+
+                    for (&(r0, r1, wy), d) in y_from_x_table
+                        .iter()
+                        .zip(d_row.as_chunks_mut::<4>().0.iter_mut())
+                    {
+                        let inv_wy = 256 - wy;
+                        let w00 = inv_wx * inv_wy;
+                        let w10 = wx * inv_wy;
+                        let w01 = inv_wx * wy;
+                        let w11 = wx * wy;
+                        let o00 = r0 + c0;
+                        let o10 = r0 + c1;
+                        let o01 = r1 + c0;
+                        let o11 = r1 + c1;
+                        let mut sampled = [
+                            ((u32::from(src[o00]) * w00
+                                + u32::from(src[o10]) * w10
+                                + u32::from(src[o01]) * w01
+                                + u32::from(src[o11]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                            ((u32::from(src[o00 + 1]) * w00
+                                + u32::from(src[o10 + 1]) * w10
+                                + u32::from(src[o01 + 1]) * w01
+                                + u32::from(src[o11 + 1]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                            ((u32::from(src[o00 + 2]) * w00
+                                + u32::from(src[o10 + 2]) * w10
+                                + u32::from(src[o01 + 2]) * w01
+                                + u32::from(src[o11 + 2]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                            ((u32::from(src[o00 + 3]) * w00
+                                + u32::from(src[o10 + 3]) * w10
+                                + u32::from(src[o01 + 3]) * w01
+                                + u32::from(src[o11 + 3]) * w11
+                                + 32_768)
+                                >> 16) as u8,
+                        ];
+                        if apply_lut {
+                            sampled = lut.apply_bgra_premul(sampled);
+                        }
+                        blend_premul_over(sampled, d);
+                    }
+                }
             }
         }
     }

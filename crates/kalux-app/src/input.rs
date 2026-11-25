@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use kalux_core::{Action, Modifiers, action_for_key};
+use kalux_core::{Action, EditAction, Modifiers, action_for_key, edit_action_for_key};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
@@ -68,10 +68,20 @@ pub fn current_modifiers() -> Modifiers {
     }
 }
 
+/// Extract the virtual-key code from a `WM_KEYDOWN` / `WM_KEYUP` `wParam`.
+#[inline]
+pub fn vk_from_wparam(wp: WPARAM) -> u16 {
+    (wp.0 & 0xFFFF) as u16
+}
+
 /// Map a `WM_KEYDOWN` / `WM_SYSKEYDOWN` `wParam` to a Kalux [`Action`].
 pub fn action_from_keydown(wp: WPARAM) -> Option<Action> {
-    let vk = (wp.0 & 0xFFFF) as u16;
-    action_for_key(vk, current_modifiers())
+    action_for_key(vk_from_wparam(wp), current_modifiers())
+}
+
+/// Map a `WM_KEYDOWN` `wParam` to a Kalux Edit Mode [`EditAction`].
+pub fn edit_action_from_keydown(wp: WPARAM) -> Option<EditAction> {
+    edit_action_for_key(vk_from_wparam(wp), current_modifiers())
 }
 
 /// Map a `WM_XBUTTONDOWN` `wParam` to `Prev` (XBUTTON1) or `Next` (XBUTTON2).

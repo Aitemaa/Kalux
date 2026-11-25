@@ -106,6 +106,26 @@ impl<K: Eq + Hash + Clone, V: Weighted> ByteLru<K, V> {
         self.pinned.extend(keys.iter().cloned());
     }
 
+    /// Evict every cached entry except `keep` (if present), updating pinned set and weight.
+    /// Used when entering Edit Mode or preparing for full-resolution export so neighbor bitmaps
+    /// release RAM immediately.
+    pub fn retain_only(&mut self, keep: Option<&K>) -> usize {
+        let mut freed = 0usize;
+        self.pinned.clear();
+        if let Some(k) = keep {
+            self.pinned.insert(k.clone());
+        }
+        self.entries.retain(|e| {
+            let keep_entry = keep.is_some_and(|k| &e.key == k);
+            if !keep_entry {
+                freed = freed.saturating_add(e.weight);
+            }
+            keep_entry
+        });
+        self.total_weight = self.entries.iter().map(|e| e.weight).sum();
+        freed
+    }
+
     pub fn total_weight(&self) -> usize {
         self.total_weight
     }

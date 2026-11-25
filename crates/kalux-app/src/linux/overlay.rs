@@ -182,6 +182,45 @@ impl LinuxOverlay {
         render_text_left(canvas, font, text, x, y_top, size_px, color);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_centered(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        text: &str,
+        cx: f32,
+        y_top: f32,
+        size_px: f32,
+        color: Rgba,
+        bold: bool,
+        mono: bool,
+    ) {
+        let fonts = self.ensure_fonts();
+        let font = if mono {
+            fonts.mono()
+        } else if bold {
+            fonts.sans_bold()
+        } else {
+            fonts.sans()
+        };
+        let Some(font) = font else {
+            return;
+        };
+        render_text_centered(canvas, font, text, cx, y_top, size_px, color);
+    }
+
+    pub fn measure_text_line(&mut self, text: &str, size_px: f32, bold: bool, mono: bool) -> f32 {
+        let fonts = self.ensure_fonts();
+        let font = if mono {
+            fonts.mono()
+        } else if bold {
+            fonts.sans_bold()
+        } else {
+            fonts.sans()
+        };
+        font.map(|f| measure_text_width(f, text, size_px))
+            .unwrap_or(0.0)
+    }
+
     fn draw_empty_hint(&mut self, canvas: &mut Canvas<'_>, s: f32, palette: Palette) {
         let w = canvas.width as f32;
         let h = canvas.height as f32;

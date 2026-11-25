@@ -29,9 +29,10 @@ Kalux = **Ka**rel + **lux** (Latin for light). Same family as [Kavox](https://gi
 - **Decode overlaps window creation:** the opened file starts decoding before the window finishes initializing; folder listing and neighbor preloading (`N±2`) run only after the first frame is on screen.
 - **Native Windows stack:** raw Win32, Direct2D (`HIGH_QUALITY_CUBIC` / `LINEAR` / `NEAREST_NEIGHBOR`), lazy DirectWrite overlays, WIC + `zune-jpeg` decoding, per-monitor DPI v2, and Mica chrome.
 - **Native Linux Wayland stack (tested on CachyOS + Niri):** pure-Rust `wayrs-client` over `$WAYLAND_DISPLAY` (`xdg-decoration` server-side mode for Niri `prefer-no-csd`, `wp_fractional_scale_v1` + `wp_viewporter`, `wp_cursor_shape_v1`, `wl_data_device` drag-and-drop, `wl_shm` `memfd` double buffering, `poll(2)` 0% idle loop, and pure-Rust JPEG/PNG/GIF/WebP/BMP/ICO/TIFF decoding). Zero `libwayland`, GTK, Qt, X11, or `fontconfig` shared library dependencies (`ldd` links only `libc`, `libm`, `libgcc_s`).
+- **Built-in Edit Mode (`E` / `C`):** non-destructive crop (with aspect presets), lossless EXIF JPEG rotate/flip, exposure/contrast/saturation/warmth/mono sliders, live hold-`\` compare, clipboard copy (`Ctrl+C`), smart save (`Ctrl+S` lossless EXIF in-place or inline Save Copy / Overwrite), and full-res memory-bounded export (~5 MB live edit delta on 12 MP).
 - **Single portable binary:** no WebView2, no Electron, no .NET, no background processes after close, zero idle CPU, no telemetry.
 
-Full requirements: [docs/PRD.md](docs/PRD.md).
+Full requirements: [docs/PRD.md](docs/PRD.md) · Edit Mode spec: [docs/PRD-edit-mode.md](docs/PRD-edit-mode.md).
 
 ## Screenshots
 
@@ -43,6 +44,14 @@ Full requirements: [docs/PRD.md](docs/PRD.md).
   <img src="docs/screenshots/shortcuts-light.png" alt="Kalux in light theme following system theme with the keyboard shortcuts overlay open" width="100%">
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/edit-crop-dark.png" alt="Kalux Edit Mode in dark theme showing the interactive crop overlay, live pixel dimension badge, and floating dock" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/edit-adjust-light.png" alt="Kalux Edit Mode in light theme showing exposure, contrast, saturation, and warmth tone sliders" width="100%">
+</p>
+
 <sub>Rendered offscreen by Kalux's own renderer (<code>kalux --screenshot assets/demo-photo.jpg ...</code>).</sub>
 
 ## Footprint
@@ -51,8 +60,9 @@ Measured on GitHub Actions (`windows-latest`, software WARP, 12 MP 4000×3000 JP
 
 | Metric | Windows Photos (est.) | **Kalux Win (CI VM)** | **Kalux Linux (Niri)** | PRD target |
 | :--- | :--- | :--- | :--- | :--- |
-| **Release binary** | 150–400 MB install | **0.62 MiB** (647 KB) | **1.84 MiB** (1.9 MB) | ≤ 4.0 MiB |
+| **Release binary** | 150–400 MB install | **0.62 MiB** (647 KB) | **2.08 MiB** (2.1 MB) | ≤ 4.0 MiB |
 | **Private RAM (12 MP open)** | 150–350 MB | **23.6 MB** *(41.5 MB WS)* | **13.4 MB** *(24.3 MB RSS)* | ≤ 50 MB |
+| **Edit Mode active (12 MP)** | 250–600 MB | *measured in CI (`--bench-edit`)* | **11.9 MB priv** *(+5.0 MB delta)* | ≤ 45 MB delta |
 | **Start → first present** | 1.5–4.0 s | **~204 ms** *(WARP VM)* | **~37 ms** *(1 MP)* / **~223 ms** *(12 MP)* | ≤ 150 ms |
 | **Next / previous (preloaded)** | 100–400 ms | **1 frame** *(cache hit)* | **1 frame** *(cache hit)* | ≤ 16 ms |
 | **Idle CPU / after close** | background process | **0% / 0 processes** | **0% / 0 processes** | 0% / 0 |
@@ -66,9 +76,15 @@ Measured on GitHub Actions (`windows-latest`, software WARP, 12 MP 4000×3000 JP
 | Wheel, `+` `-` | Zoom (anchored at cursor; high-res wheel supported) |
 | `0` / `1` | Fit to window / 100% actual pixels |
 | Left-drag | Pan when zoomed in |
+| `E` / `C` | Enter Edit Mode / jump straight to Crop |
+| `R` / `Shift+R` · `H` / `V` | Rotate 90° CW / CCW · Flip horizontal / vertical (Edit Mode) |
+| `M` · `\` (hold) | Monochrome toggle · Hold to compare original (Edit Mode) |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / Redo edit step (Edit Mode) |
+| `Ctrl+S` / `Ctrl+Shift+S` | Smart Save / Save Copy (Edit Mode) |
+| `Ctrl+C` · `Shift+E` | Copy edited image · Hand off to Kapix (Edit Mode) |
 | `F11`, double-click | Fullscreen |
 | `?` | Keyboard shortcuts overlay |
-| `Esc` / `Ctrl+W` | Exit fullscreen, then close |
+| `Esc` / `Ctrl+W` | Exit Edit Mode / fullscreen, then close |
 
 ## CLI
 
@@ -76,8 +92,9 @@ Measured on GitHub Actions (`windows-latest`, software WARP, 12 MP 4000×3000 JP
 kalux path/to/photo.jpg                                  # open an image
 kalux --version                                          # print version
 kalux --bench-startup photo.jpg [--bench-out out.jsonl]  # JSON startup + RAM timings
+kalux --bench-edit photo.jpg [--bench-out out.jsonl]     # Edit Mode RAM + frame + export bench
 kalux --gen-test-image test.jpg 4000 3000                # deterministic 12 MP test JPEG
-kalux --screenshot photo.jpg out.png [--light] [--help]  # offscreen PNG render
+kalux --screenshot photo.jpg out.png [--light] [--help|--edit-crop|--edit-adjust]
 ```
 
 On Linux, you can override the auto-detected GTK dark/light theme with `KALUX_THEME=dark` or `KALUX_THEME=light`.

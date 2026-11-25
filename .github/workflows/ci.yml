@@ -67,6 +67,11 @@ jobs:
           "### Startup bench (5 runs)`n``````" | Out-File -Append $env:GITHUB_STEP_SUMMARY
           Get-Content bench-out/startup.jsonl | Out-File -Append $env:GITHUB_STEP_SUMMARY
           "``````" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          & $exe --bench-edit bench-out/test-12mp.jpg | Tee-Object bench-out/edit.jsonl
+          if ($LASTEXITCODE -ne 0) { throw "--bench-edit failed ($LASTEXITCODE)" }
+          "### Edit Mode bench (12 MP)`n``````" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          Get-Content bench-out/edit.jsonl | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "``````" | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
       - name: Render screenshots (Direct2D + DirectWrite)
         shell: bash
@@ -78,6 +83,10 @@ jobs:
           ./target/release/kalux.exe --screenshot assets/demo-photo.jpg screenshots-out/shortcuts-light.png \
             --light --help \
             --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux"
+          ./target/release/kalux.exe --screenshot assets/demo-photo.jpg screenshots-out/edit-crop-dark.png \
+            --edit-crop
+          ./target/release/kalux.exe --screenshot assets/demo-photo.jpg screenshots-out/edit-adjust-light.png \
+            --light --edit-adjust
           ls -lh screenshots-out/
 
       - name: Build Windows installer
@@ -104,6 +113,7 @@ jobs:
             target/release/kalux-*-windows-x64-setup.exe
             target/release/kalux.exe
             bench-out/startup.jsonl
+            bench-out/edit.jsonl
             screenshots-out/*.png
           if-no-files-found: ignore
 
@@ -148,17 +158,28 @@ jobs:
             echo "::error::Unexpected GUI shared library dependency"; exit 1
           fi
 
-      - name: CLI & offscreen screenshot smoke test
+      - name: CLI, Edit Mode bench & offscreen screenshot smoke test
         run: |
           mkdir -p bench-out screenshots-out
           ./target/release/kalux --version
           ./target/release/kalux --gen-test-image bench-out/test-12mp.jpg 4000 3000
+          ./target/release/kalux --bench-edit bench-out/test-12mp.jpg | tee bench-out/edit.jsonl
+          {
+            echo "### Edit Mode bench (Linux, 12 MP)"
+            echo '```json'
+            cat bench-out/edit.jsonl
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           ./target/release/kalux --screenshot assets/demo-photo.jpg screenshots-out/linux-dark.png \
             --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux" \
             --toast "100% · Fit"
           ./target/release/kalux --screenshot assets/demo-photo.jpg screenshots-out/linux-light.png \
             --light --help \
             --title "dolomites.jpg — 1 / 12 — 1376×768 — Kalux"
+          ./target/release/kalux --screenshot assets/demo-photo.jpg screenshots-out/linux-edit-crop-dark.png \
+            --edit-crop
+          ./target/release/kalux --screenshot assets/demo-photo.jpg screenshots-out/linux-edit-adjust-light.png \
+            --light --edit-adjust
           ls -lh bench-out/ screenshots-out/
 
       - uses: actions/upload-artifact@v7
@@ -169,5 +190,6 @@ jobs:
             target/release/kalux
             packaging/linux/kalux.desktop
             packaging/linux/install.sh
+            bench-out/edit.jsonl
             screenshots-out/*.png
           if-no-files-found: ignore

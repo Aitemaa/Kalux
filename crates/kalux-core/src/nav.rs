@@ -355,6 +355,21 @@ impl Playlist {
         }
         Some(&self.files[self.index])
     }
+
+    /// Insert `path` in natural sort order (if not already present) and select it as current.
+    pub fn insert_and_select(&mut self, path: PathBuf) -> &Path {
+        if let Some(pos) = self.files.iter().position(|p| paths_match(p, &path)) {
+            self.index = pos;
+            return &self.files[self.index];
+        }
+        let pos = self
+            .files
+            .binary_search_by(|existing| path_sort_cmp(existing, &path))
+            .unwrap_or_else(|i| i);
+        self.files.insert(pos, path);
+        self.index = pos;
+        &self.files[self.index]
+    }
 }
 
 #[cfg(test)]

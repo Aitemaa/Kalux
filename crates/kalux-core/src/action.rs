@@ -1,21 +1,36 @@
-//! User actions and the default keymap (PRD §8). Keys are Win32 virtual-key codes as `u16`
+//! User actions and the default keymap (PRD §8 & Edit Mode PRD §8).
+//! Keys are Win32 virtual-key codes as `u16` (and Linux evdev keycodes as `u32`)
 //! so this crate stays platform-independent.
 
+const VK_RETURN: u16 = 0x0D;
 const VK_ESCAPE: u16 = 0x1B;
 const VK_PRIOR: u16 = 0x21; // Page Up
 const VK_NEXT: u16 = 0x22; // Page Down
 const VK_END: u16 = 0x23;
 const VK_HOME: u16 = 0x24;
 const VK_LEFT: u16 = 0x25;
+const VK_UP: u16 = 0x26;
 const VK_RIGHT: u16 = 0x27;
+const VK_DOWN: u16 = 0x28;
 const VK_DELETE: u16 = 0x2E;
 const VK_0: u16 = 0x30;
 const VK_1: u16 = 0x31;
+const VK_2: u16 = 0x32;
+const VK_A: u16 = 0x41;
 const VK_C: u16 = 0x43;
+const VK_D: u16 = 0x44;
 const VK_E: u16 = 0x45;
+const VK_H: u16 = 0x48;
 const VK_I: u16 = 0x49;
+const VK_M: u16 = 0x4D;
+const VK_O: u16 = 0x4F;
 const VK_R: u16 = 0x52;
+const VK_S: u16 = 0x53;
+const VK_V: u16 = 0x56;
 const VK_W: u16 = 0x57;
+const VK_X: u16 = 0x58;
+const VK_Y: u16 = 0x59;
+const VK_Z: u16 = 0x5A;
 const VK_NUMPAD0: u16 = 0x60;
 const VK_NUMPAD1: u16 = 0x61;
 const VK_ADD: u16 = 0x6B;
@@ -24,6 +39,12 @@ const VK_F11: u16 = 0x7A;
 const VK_OEM_PLUS: u16 = 0xBB;
 const VK_OEM_MINUS: u16 = 0xBD;
 const VK_OEM_2: u16 = 0xBF; // '/' and '?' on US layout
+const VK_OEM_5: u16 = 0xDC; // '\' on US layout
+
+/// Win32 virtual keycode for the hold-to-compare key (`\`).
+pub const VK_COMPARE: u16 = VK_OEM_5;
+/// Linux evdev keycode for the hold-to-compare key (`\` = `KEY_BACKSLASH`).
+pub const EVDEV_KEY_COMPARE: u32 = 43;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -40,7 +61,10 @@ pub enum Action {
     Escape,
     Close,
     ShowHelp,
-    // v0.2 (keymap entries exist now so the help overlay is complete; app may no-op them):
+    // Edit Mode (v0.3):
+    EditMode,
+    CropMode,
+    // v0.2+:
     RotateCw,
     RotateCcw,
     ToggleInfo,
@@ -50,6 +74,33 @@ pub enum Action {
     EditInKapix,
 }
 
+/// Mode-specific actions while Edit Mode is active.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EditAction {
+    TabCrop,
+    TabAdjust,
+    RotateCw,
+    RotateCcw,
+    FlipH,
+    FlipV,
+    SwapAspect,
+    ToggleMonochrome,
+    /// `(dx_px, dy_px, resize_bottom_right)`
+    NudgeCrop(i32, i32, bool),
+    Undo,
+    Redo,
+    ResetAll,
+    CopyEdited,
+    SmartSave,
+    SaveCopy,
+    ConfirmPrimary,
+    ConfirmOverwrite,
+    ConfirmDiscard,
+    EditInKapix,
+    ExitOrCancel,
+    CloseWindow,
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
     pub ctrl: bool,
@@ -57,10 +108,7 @@ pub struct Modifiers {
     pub alt: bool,
 }
 
-/// Map a Win32 virtual-key code + modifiers to an action.
-/// Must cover: Left/Right/PageUp/PageDown/Home/End, `+`/`-` (VK_OEM_PLUS/MINUS, VK_ADD/SUBTRACT),
-/// `0`/`1` (top row and numpad), F11, Esc, `?` (Shift+VK_OEM_2), R / Shift+R, I, Delete,
-/// Ctrl+C / Ctrl+Shift+C, E, Ctrl+W (Close).
+/// Map a Win32 virtual-key code + modifiers to a Viewer Mode [`Action`].
 pub fn action_for_key(vk: u16, mods: Modifiers) -> Option<Action> {
     if mods.alt {
         return None;
@@ -84,26 +132,67 @@ pub fn action_for_key(vk: u16, mods: Modifiers) -> Option<Action> {
         (VK_W, true, false) => Some(Action::Close),
         (VK_OEM_2, false, true) => Some(Action::ShowHelp),
 
+        (VK_E, false, false) => Some(Action::EditMode),
+        (VK_C, false, false) => Some(Action::CropMode),
+        (VK_E, false, true) => Some(Action::EditInKapix),
+
         (VK_R, false, false) => Some(Action::RotateCw),
         (VK_R, false, true) => Some(Action::RotateCcw),
         (VK_I, false, false) => Some(Action::ToggleInfo),
         (VK_DELETE, false, false) => Some(Action::Delete),
         (VK_C, true, false) => Some(Action::CopyImage),
         (VK_C, true, true) => Some(Action::CopyPath),
-        (VK_E, false, false) => Some(Action::EditInKapix),
 
         _ => None,
     }
 }
 
+/// Map a Win32 virtual-key code + modifiers to an [`EditAction`] while in Edit Mode.
+pub fn edit_action_for_key(vk: u16, mods: Modifiers) -> Option<EditAction> {
+    if mods.alt {
+        return None;
+    }
+
+    let step = if mods.shift { 10 } else { 1 };
+    match (vk, mods.ctrl, mods.shift) {
+        (VK_1 | VK_C, false, false) => Some(EditAction::TabCrop),
+        (VK_2 | VK_A, false, false) => Some(EditAction::TabAdjust),
+        (VK_R, false, false) => Some(EditAction::RotateCw),
+        (VK_R, false, true) => Some(EditAction::RotateCcw),
+        (VK_H, false, false) => Some(EditAction::FlipH),
+        (VK_V, false, false) => Some(EditAction::FlipV),
+        (VK_X, false, false) => Some(EditAction::SwapAspect),
+        (VK_M, false, false) => Some(EditAction::ToggleMonochrome),
+
+        (VK_LEFT, ctrl, _) => Some(EditAction::NudgeCrop(-step, 0, ctrl)),
+        (VK_RIGHT, ctrl, _) => Some(EditAction::NudgeCrop(step, 0, ctrl)),
+        (VK_UP, ctrl, _) => Some(EditAction::NudgeCrop(0, -step, ctrl)),
+        (VK_DOWN, ctrl, _) => Some(EditAction::NudgeCrop(0, step, ctrl)),
+
+        (VK_Z, true, false) => Some(EditAction::Undo),
+        (VK_Y, true, false) | (VK_Z, true, true) => Some(EditAction::Redo),
+        (VK_R, true, false) => Some(EditAction::ResetAll),
+        (VK_C, true, false) => Some(EditAction::CopyEdited),
+        (VK_S, true, false) => Some(EditAction::SmartSave),
+        (VK_S, true, true) => Some(EditAction::SaveCopy),
+
+        (VK_RETURN, false, false) => Some(EditAction::ConfirmPrimary),
+        (VK_O, false, false) => Some(EditAction::ConfirmOverwrite),
+        (VK_D, false, false) => Some(EditAction::ConfirmDiscard),
+        (VK_E, false, true) => Some(EditAction::EditInKapix),
+        (VK_E, false, false) | (VK_ESCAPE, false, false) => Some(EditAction::ExitOrCancel),
+        (VK_W, true, false) => Some(EditAction::CloseWindow),
+        _ => None,
+    }
+}
+
 /// Map a Linux evdev keycode (`linux/input-event-codes.h`, i.e. Wayland `wl_keyboard::key` raw
-/// keycode) + modifiers to a Kalux [`Action`].
+/// keycode) + modifiers to a Kalux Viewer Mode [`Action`].
 pub fn action_for_linux_evdev(keycode: u32, mods: Modifiers) -> Option<Action> {
     if mods.alt {
         return None;
     }
 
-    // Standard Linux evdev keycodes (input-event-codes.h).
     const KEY_ESC: u32 = 1;
     const KEY_1: u32 = 2;
     const KEY_0: u32 = 11;
@@ -145,14 +234,80 @@ pub fn action_for_linux_evdev(keycode: u32, mods: Modifiers) -> Option<Action> {
         (KEY_W, true, false) => Some(Action::Close),
         (KEY_SLASH, false, true) => Some(Action::ShowHelp),
 
+        (KEY_E, false, false) => Some(Action::EditMode),
+        (KEY_C, false, false) => Some(Action::CropMode),
+        (KEY_E, false, true) => Some(Action::EditInKapix),
+
         (KEY_R, false, false) => Some(Action::RotateCw),
         (KEY_R, false, true) => Some(Action::RotateCcw),
         (KEY_I, false, false) => Some(Action::ToggleInfo),
         (KEY_DELETE, false, false) => Some(Action::Delete),
         (KEY_C, true, false) => Some(Action::CopyImage),
         (KEY_C, true, true) => Some(Action::CopyPath),
-        (KEY_E, false, false) => Some(Action::EditInKapix),
 
+        _ => None,
+    }
+}
+
+/// Map a Linux evdev keycode + modifiers to an [`EditAction`] while in Edit Mode.
+pub fn edit_action_for_linux_evdev(keycode: u32, mods: Modifiers) -> Option<EditAction> {
+    if mods.alt {
+        return None;
+    }
+
+    const KEY_ESC: u32 = 1;
+    const KEY_1: u32 = 2;
+    const KEY_2: u32 = 3;
+    const KEY_W: u32 = 17;
+    const KEY_E: u32 = 18;
+    const KEY_R: u32 = 19;
+    const KEY_Y: u32 = 21;
+    const KEY_O: u32 = 24;
+    const KEY_ENTER: u32 = 28;
+    const KEY_A: u32 = 30;
+    const KEY_S: u32 = 31;
+    const KEY_D: u32 = 32;
+    const KEY_H: u32 = 35;
+    const KEY_Z: u32 = 44;
+    const KEY_X: u32 = 45;
+    const KEY_C: u32 = 46;
+    const KEY_V: u32 = 47;
+    const KEY_M: u32 = 50;
+    const KEY_KPENTER: u32 = 96;
+    const KEY_UP: u32 = 103;
+    const KEY_LEFT: u32 = 105;
+    const KEY_RIGHT: u32 = 106;
+    const KEY_DOWN: u32 = 108;
+
+    let step = if mods.shift { 10 } else { 1 };
+    match (keycode, mods.ctrl, mods.shift) {
+        (KEY_1 | KEY_C, false, false) => Some(EditAction::TabCrop),
+        (KEY_2 | KEY_A, false, false) => Some(EditAction::TabAdjust),
+        (KEY_R, false, false) => Some(EditAction::RotateCw),
+        (KEY_R, false, true) => Some(EditAction::RotateCcw),
+        (KEY_H, false, false) => Some(EditAction::FlipH),
+        (KEY_V, false, false) => Some(EditAction::FlipV),
+        (KEY_X, false, false) => Some(EditAction::SwapAspect),
+        (KEY_M, false, false) => Some(EditAction::ToggleMonochrome),
+
+        (KEY_LEFT, ctrl, _) => Some(EditAction::NudgeCrop(-step, 0, ctrl)),
+        (KEY_RIGHT, ctrl, _) => Some(EditAction::NudgeCrop(step, 0, ctrl)),
+        (KEY_UP, ctrl, _) => Some(EditAction::NudgeCrop(0, -step, ctrl)),
+        (KEY_DOWN, ctrl, _) => Some(EditAction::NudgeCrop(0, step, ctrl)),
+
+        (KEY_Z, true, false) => Some(EditAction::Undo),
+        (KEY_Y, true, false) | (KEY_Z, true, true) => Some(EditAction::Redo),
+        (KEY_R, true, false) => Some(EditAction::ResetAll),
+        (KEY_C, true, false) => Some(EditAction::CopyEdited),
+        (KEY_S, true, false) => Some(EditAction::SmartSave),
+        (KEY_S, true, true) => Some(EditAction::SaveCopy),
+
+        (KEY_ENTER | KEY_KPENTER, false, false) => Some(EditAction::ConfirmPrimary),
+        (KEY_O, false, false) => Some(EditAction::ConfirmOverwrite),
+        (KEY_D, false, false) => Some(EditAction::ConfirmDiscard),
+        (KEY_E, false, true) => Some(EditAction::EditInKapix),
+        (KEY_E, false, false) | (KEY_ESC, false, false) => Some(EditAction::ExitOrCancel),
+        (KEY_W, true, false) => Some(EditAction::CloseWindow),
         _ => None,
     }
 }
@@ -164,13 +319,13 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("0 / 1", "Fit to window / 100%"),
     ("Drag", "Pan when zoomed"),
     ("F11 / Double-click", "Toggle fullscreen"),
-    ("R / Shift+R", "Rotate clockwise / counter-clockwise"),
-    ("I", "Toggle info panel"),
-    ("Del", "Move to Recycle Bin"),
-    ("Ctrl+C / Ctrl+Shift+C", "Copy image / file path"),
-    ("E", "Edit in kapix"),
+    ("E / C", "Edit mode / Crop directly"),
+    ("R / Shift+R · H / V", "Rotate / Flip (in Edit mode)"),
+    ("Ctrl+S / Ctrl+Shift+S", "Smart save / Save copy"),
+    ("Ctrl+C", "Copy image to clipboard"),
+    ("Shift+E", "Annotate in Kapix"),
     ("?", "Toggle shortcuts overlay"),
-    ("Esc / Ctrl+W", "Exit fullscreen / close"),
+    ("Esc / Ctrl+W", "Exit edit / fullscreen / close"),
 ];
 
 /// (key label, description) rows for the `?` help overlay, in display order.
@@ -233,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn window_and_v02_keys() {
+    fn window_and_edit_entry_keys() {
         assert_eq!(action_for_key(VK_F11, NONE), Some(Action::ToggleFullscreen));
         assert_eq!(action_for_key(VK_ESCAPE, NONE), Some(Action::Escape));
         assert_eq!(action_for_key(VK_W, CTRL), Some(Action::Close));
@@ -246,8 +401,55 @@ mod tests {
         assert_eq!(action_for_key(VK_DELETE, NONE), Some(Action::Delete));
         assert_eq!(action_for_key(VK_C, CTRL), Some(Action::CopyImage));
         assert_eq!(action_for_key(VK_C, CTRL_SHIFT), Some(Action::CopyPath));
-        assert_eq!(action_for_key(VK_C, NONE), None);
-        assert_eq!(action_for_key(VK_E, NONE), Some(Action::EditInKapix));
+        assert_eq!(action_for_key(VK_C, NONE), Some(Action::CropMode));
+        assert_eq!(action_for_key(VK_E, NONE), Some(Action::EditMode));
+        assert_eq!(action_for_key(VK_E, SHIFT), Some(Action::EditInKapix));
+    }
+
+    #[test]
+    fn edit_mode_win32_and_linux_keys() {
+        assert_eq!(edit_action_for_key(VK_R, NONE), Some(EditAction::RotateCw));
+        assert_eq!(
+            edit_action_for_key(VK_R, SHIFT),
+            Some(EditAction::RotateCcw)
+        );
+        assert_eq!(edit_action_for_key(VK_H, NONE), Some(EditAction::FlipH));
+        assert_eq!(edit_action_for_key(VK_V, NONE), Some(EditAction::FlipV));
+        assert_eq!(edit_action_for_key(VK_S, CTRL), Some(EditAction::SmartSave));
+        assert_eq!(
+            edit_action_for_key(VK_S, CTRL_SHIFT),
+            Some(EditAction::SaveCopy)
+        );
+        assert_eq!(edit_action_for_key(VK_Z, CTRL), Some(EditAction::Undo));
+        assert_eq!(
+            edit_action_for_key(VK_Z, CTRL_SHIFT),
+            Some(EditAction::Redo)
+        );
+        assert_eq!(
+            edit_action_for_key(VK_RIGHT, SHIFT),
+            Some(EditAction::NudgeCrop(10, 0, false))
+        );
+        assert_eq!(
+            edit_action_for_key(VK_DOWN, CTRL),
+            Some(EditAction::NudgeCrop(0, 1, true))
+        );
+
+        assert_eq!(
+            edit_action_for_linux_evdev(31, CTRL),
+            Some(EditAction::SmartSave)
+        );
+        assert_eq!(
+            edit_action_for_linux_evdev(31, CTRL_SHIFT),
+            Some(EditAction::SaveCopy)
+        );
+        assert_eq!(
+            edit_action_for_linux_evdev(44, CTRL),
+            Some(EditAction::Undo)
+        );
+        assert_eq!(
+            edit_action_for_linux_evdev(106, SHIFT),
+            Some(EditAction::NudgeCrop(10, 0, false))
+        );
     }
 
     #[test]
@@ -278,6 +480,9 @@ mod tests {
         assert_eq!(action_for_linux_evdev(17, CTRL), Some(Action::Close));
         assert_eq!(action_for_linux_evdev(53, SHIFT), Some(Action::ShowHelp));
         assert_eq!(action_for_linux_evdev(53, NONE), None);
+        assert_eq!(action_for_linux_evdev(18, NONE), Some(Action::EditMode));
+        assert_eq!(action_for_linux_evdev(46, NONE), Some(Action::CropMode));
+        assert_eq!(action_for_linux_evdev(18, SHIFT), Some(Action::EditInKapix));
         assert_eq!(action_for_linux_evdev(106, ALT), None);
     }
 }

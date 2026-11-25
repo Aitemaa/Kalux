@@ -235,6 +235,7 @@ dependencies = [
  "gif",
  "image",
  "image-webp",
+ "jpeg-encoder",
  "kalux-core",
  "kamadak-exif",
  "png",

@@ -1,6 +1,7 @@
 //! Linux native Wayland backend (`kalux` on CachyOS / Niri and any Wayland compositor).
 
 pub mod bench;
+pub mod edit_ui;
 pub mod overlay;
 pub mod render;
 pub mod screenshot;
@@ -41,6 +42,7 @@ pub fn run_linux(main_start: Instant) -> i32 {
             out,
             light,
             show_help,
+            edit_mode,
             toast,
             title,
             width,
@@ -51,6 +53,7 @@ pub fn run_linux(main_start: Instant) -> i32 {
                 out,
                 light,
                 show_help,
+                edit_mode,
                 toast,
                 title,
                 width,
@@ -70,6 +73,14 @@ pub fn run_linux(main_start: Instant) -> i32 {
                 initial_error: None,
                 bench: Some(bench),
             })
+        }
+
+        Ok(Command::BenchEdit { file, out }) => {
+            if let Err(err) = bench::run_edit_bench(&file, out.as_deref()) {
+                eprintln!("kalux: --bench-edit failed: {err}");
+                return 1;
+            }
+            0
         }
 
         Ok(Command::Open { file }) => wayland::run(LaunchConfig {

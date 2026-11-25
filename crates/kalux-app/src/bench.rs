@@ -182,6 +182,11 @@ fn measure_process_create_to_now_ms() -> f64 {
 }
 
 fn sample_memory_mb() -> (f64, f64) {
+    let (priv_mb, ws_mb, _) = sample_memory_mb_all();
+    (priv_mb, ws_mb)
+}
+
+fn sample_memory_mb_all() -> (f64, f64, f64) {
     let mut pmc = PROCESS_MEMORY_COUNTERS_EX {
         cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
         ..Default::default()
@@ -197,14 +202,183 @@ fn sample_memory_mb() -> (f64, f64) {
         )
     };
     if res.is_err() {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0);
     }
 
     const MIB: f64 = 1024.0 * 1024.0;
     (
         pmc.PrivateUsage as f64 / MIB,
         pmc.WorkingSetSize as f64 / MIB,
+        pmc.PeakWorkingSetSize as f64 / MIB,
     )
+}
+
+/// Run the headless Edit Mode RAM & latency benchmark (`--bench-edit`) on Windows.
+pub fn run_edit_bench(file: &Path, out_path: Option<&Path>) -> Result<(), String> {
+    use kalux_core::edit::edit_image_dest_rect;
+    use kalux_core::{
+        CropRect, DockLayout, EditRecipe, EditSession, EditTab, QuarterTurns, ToneAdjustments,
+    };
+    use kalux_decode::{ExportOptions, decode_file, export_image};
+
+    let (vp_w, vp_h) = (1920u32, 1080u32);
+
+    // 1. Viewer baseline: display-scaled decode at 1920x1080 target.
+    let decoded = decode_file(file, Some((vp_w, vp_h))).map_err(|e| e.to_string())?;
+    let src_sz = (decoded.source_width, decoded.source_height);
+    let (viewer_private_mb, viewer_rss_mb, _) = sample_memory_mb_all();
+
+    // 2. Edit Mode active: 30 live-preview scrub frames over the proxy buffer.
+    let mut session = EditSession::new(
+        EditTab::Adjust,
+        decoded.is_animated(),
+        0,
+        decoded.frames.len(),
+    );
+    let base_pixels = decoded
+        .frames
+        .first()
+        .map(|f| f.pixels.as_slice())
+        .ok_or_else(|| "decoded image has no frames".to_string())?;
+    let mut staging = vec![0u8; base_pixels.len()];
+    let mut frame_times_ms = Vec::with_capacity(30);
+
+    for i in 0..30usize {
+        let t = (i as f32 / 29.0) * 2.0 - 1.0;
+        session.history.push(EditRecipe {
+            crop: CropRect {
+                x: 0.1,
+                y: 0.1,
+                w: 0.8,
+                h: 0.8,
+            },
+            turns: if i % 2 == 0 {
+                QuarterTurns::R0
+            } else {
+                QuarterTurns::R90
+            },
+            flip_h: false,
+            flip_v: false,
+            tone: ToneAdjustments {
+                exposure: t * 0.4,
+                contrast: t * 0.3,
+                saturation: t * 0.25,
+                warmth: -t * 0.2,
+                monochrome: false,
+            },
+        });
+        let t0 = Instant::now();
+        let layout = DockLayout::compute(vp_w, vp_h, 1.0, &session);
+        let recipe = session.recipe();
+        let oriented = recipe.oriented_dims(src_sz.0, src_sz.1);
+        let _ = edit_image_dest_rect(oriented, (vp_w, vp_h), layout.reserved_bottom_px, 1.0);
+        let lut = session.preview_lut();
+        staging.copy_from_slice(base_pixels);
+        lut.apply_bgra_premul_slice(&mut staging);
+        frame_times_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    frame_times_ms.sort_by(|a, b| a.total_cmp(b));
+    let preview_median_ms = frame_times_ms[frame_times_ms.len() / 2];
+    let preview_p95_ms = frame_times_ms[(frame_times_ms.len() * 95 / 100).min(29)];
+    let (edit_active_private_mb, edit_active_rss_mb, _) = sample_memory_mb_all();
+
+    // 3. Full-resolution export of a cropped + toned recipe to a temporary copy.
+    drop(staging);
+    let export_recipe = EditRecipe {
+        crop: CropRect {
+            x: 0.12,
+            y: 0.10,
+            w: 0.76,
+            h: 0.80,
+        },
+        turns: QuarterTurns::R90,
+        flip_h: false,
+        flip_v: false,
+        tone: ToneAdjustments {
+            exposure: 0.15,
+            contrast: 0.2,
+            saturation: 0.1,
+            warmth: 0.15,
+            monochrome: false,
+        },
+    };
+    let t_exp = Instant::now();
+    let res = export_image(
+        file,
+        &export_recipe,
+        ExportOptions {
+            jpeg_quality: 92,
+            save_copy: true,
+            format_override: None,
+        },
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    let export_ms = t_exp.elapsed().as_secs_f64() * 1000.0;
+    let _ = std::fs::remove_file(&res.saved_path);
+
+    // 4. Exit Edit Mode & drop session; sample post-export settled RAM + peak working set.
+    drop(session);
+    let (post_export_private_mb, post_export_rss_mb, export_peak_rss_mb) = sample_memory_mb_all();
+
+    let mut out = String::with_capacity(384);
+    out.push_str("{\"file\":\"");
+    push_json_escaped(&mut out, &file.to_string_lossy());
+    out.push_str("\",\"source_width\":");
+    out.push_str(&decoded.source_width.to_string());
+    out.push_str(",\"source_height\":");
+    out.push_str(&decoded.source_height.to_string());
+    out.push_str(",\"viewer_private_mb\":");
+    push_f64_2(&mut out, viewer_private_mb);
+    out.push_str(",\"viewer_rss_mb\":");
+    push_f64_2(&mut out, viewer_rss_mb);
+    out.push_str(",\"edit_active_private_mb\":");
+    push_f64_2(&mut out, edit_active_private_mb);
+    out.push_str(",\"edit_active_rss_mb\":");
+    push_f64_2(&mut out, edit_active_rss_mb);
+    out.push_str(",\"preview_frame_median_ms\":");
+    push_f64_2(&mut out, preview_median_ms);
+    out.push_str(",\"preview_frame_p95_ms\":");
+    push_f64_2(&mut out, preview_p95_ms);
+    out.push_str(",\"export_ms\":");
+    push_f64_2(&mut out, export_ms);
+    out.push_str(",\"export_peak_rss_mb\":");
+    push_f64_2(&mut out, export_peak_rss_mb);
+    out.push_str(",\"post_export_private_mb\":");
+    push_f64_2(&mut out, post_export_private_mb);
+    out.push_str(",\"post_export_rss_mb\":");
+    push_f64_2(&mut out, post_export_rss_mb);
+    out.push_str(",\"export_width\":");
+    out.push_str(&res.width.to_string());
+    out.push_str(",\"export_height\":");
+    out.push_str(&res.height.to_string());
+    out.push('}');
+
+    if let Some(p) = out_path {
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .map_err(|e| format!("open {}: {e}", p.display()))?;
+        writeln!(f, "{out}").map_err(|e| format!("write {}: {e}", p.display()))?;
+        let _ = f.flush();
+    }
+
+    attach_console_if_needed();
+    let stdout_res = {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{out}").and_then(|()| stdout.flush())
+    };
+    if out_path.is_none() {
+        stdout_res.map_err(|e| format!("stdout: {e}"))?;
+    }
+    Ok(())
 }
 
 fn current_exe_bytes() -> u64 {
