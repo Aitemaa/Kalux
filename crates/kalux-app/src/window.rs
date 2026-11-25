@@ -7,21 +7,35 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use kalux_core::{Action, DecodedImage, Palette, Playlist, View};
-use kalux_decode::{DecodeError, ImageStore, StoreConfig, StoreEvent};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use kalux_core::action::VK_COMPARE;
+use kalux_core::edit::{EditDrag, edit_image_dest_rect, hit_test_crop};
+use kalux_core::{
+    Action, CropHandle, CropRect, DecodedImage, DockButton, DockLayout, EditAction, EditPrompt,
+    EditSession, EditTab, ImageFormat, Palette, Playlist, Rect, ToneSlider, View,
+};
+use kalux_decode::{
+    DecodeError, ExportError, ExportOptions, ExportResult, ImageStore, StoreConfig, StoreEvent,
+    export_image, render_edited_image, supports_in_place_overwrite,
+};
+use windows::Win32::Foundation::{
+    COLORREF, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW, HBRUSH, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
-    MonitorFromWindow, PAINTSTRUCT, UpdateWindow,
+    BI_RGB, BITMAPINFOHEADER, BeginPaint, CreateSolidBrush, DeleteObject, EndPaint,
+    GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFO, MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT, UpdateWindow,
+};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -29,34 +43,41 @@ use windows::Win32::UI::Shell::DragAcceptFiles;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowLongW, GetWindowPlacement, HWND_TOP, IDC_ARROW, KillTimer, LoadCursorW, LoadIconW,
-    MINMAXINFO, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SIZE_MINIMIZED, SW_SHOW,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SetTimer, SetWindowLongPtrW, SetWindowLongW, SetWindowPlacement, SetWindowPos, SetWindowTextW,
-    ShowWindow, TranslateMessage, UnregisterClassW, WINDOWPLACEMENT, WM_APP, WM_CAPTURECHANGED,
-    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSEXW,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    GetWindowLongW, GetWindowPlacement, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_CROSS, IDC_HAND,
+    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW,
+    LoadIconW, MINMAXINFO, MSG, PostMessageW, PostQuitMessage, RegisterClassExW, SIZE_MINIMIZED,
+    SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowLongW, SetWindowPlacement,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, UnregisterClassW, WINDOWPLACEMENT,
+    WM_APP, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR,
+    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_ACCEPTFILES,
+    WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::bench::{BenchState, attach_console_if_needed};
 use crate::input;
 use crate::overlay::{ErrorCard, OverlayView};
-use crate::render::Renderer;
+use crate::render::{EditRenderView, Renderer};
 
 const WINDOW_CLASS: PCWSTR = w!("KaluxMainWindow");
 
 const WM_APP_DECODED: u32 = WM_APP + 1;
 const WM_APP_PLAYLIST: u32 = WM_APP + 2;
+const WM_APP_EXPORT_DONE: u32 = WM_APP + 3;
+const WM_APP_CLIPBOARD_DONE: u32 = WM_APP + 4;
+
+const CF_DIB: u32 = 8;
 
 const TIMER_ANIM: usize = 1;
 const TIMER_TOAST: usize = 2;
 const TIMER_BENCH_SAMPLE: usize = 3;
 const TIMER_BENCH_TIMEOUT: usize = 4;
 
-const TOAST_DURATION_MS: u32 = 1200;
+const TOAST_DURATION_MS: u32 = 1600;
+const DOUBLE_CLICK_MAX_GAP: Duration = Duration::from_millis(400);
 const BENCH_SAMPLE_DELAY_MS: u32 = 1000;
 const BENCH_TIMEOUT_MS: u32 = 30_000;
 
@@ -74,7 +95,14 @@ struct FullscreenSaved {
     placement: WINDOWPLACEMENT,
 }
 
+struct ExportOutcome {
+    save_copy: bool,
+    result: Result<ExportResult, ExportError>,
+}
+
 type SharedScanResult = Arc<Mutex<Option<(u64, Playlist)>>>;
+type SharedExportResult = Arc<Mutex<Option<ExportOutcome>>>;
+type SharedClipboardResult = Arc<Mutex<Option<Result<DecodedImage, String>>>>;
 
 struct AppState {
     hwnd_slot: Arc<AtomicIsize>,
@@ -102,6 +130,13 @@ struct AppState {
     loading_label: Option<String>,
     toast: Option<String>,
     show_help: bool,
+
+    // Edit Mode
+    edit: Option<EditSession>,
+    compare_via_dock: bool,
+    last_slider_click: Option<(Instant, ToneSlider)>,
+    export_result: SharedExportResult,
+    clipboard_result: SharedClipboardResult,
 
     // Mouse drag panning
     dragging: bool,
@@ -215,6 +250,11 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         loading_label: None,
         toast: None,
         show_help: false,
+        edit: None,
+        compare_via_dock: false,
+        last_slider_click: None,
+        export_result: Arc::new(Mutex::new(None)),
+        clipboard_result: Arc::new(Mutex::new(None)),
         dragging: false,
         last_drag_pos: (0, 0),
         fullscreen: None,
@@ -426,10 +466,12 @@ impl AppState {
         self.playlist = Some(scanned);
         self.update_title(hwnd);
 
-        // Preload N±radius neighbors without disturbing the already-displayed first frame.
-        let _ = self
-            .store
-            .focus(&focus_target, &neighbors, self.monitor_size);
+        // Preload N±radius neighbors only when not in Edit Mode so RAM stays strictly bounded.
+        if self.edit.is_none() {
+            let _ = self
+                .store
+                .focus(&focus_target, &neighbors, self.monitor_size);
+        }
     }
 
     fn set_decoded_image(&mut self, hwnd: HWND, image: Arc<DecodedImage>, reset_view: bool) {
@@ -507,6 +549,9 @@ impl AppState {
     }
 
     fn open_dropped_file(&mut self, hwnd: HWND, path: PathBuf) {
+        if self.edit.is_some() {
+            self.exit_edit_mode(hwnd);
+        }
         self.playlist = Some(Playlist::single(path.clone()));
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.focus_path(hwnd, path.clone(), &[]);
@@ -558,6 +603,802 @@ impl AppState {
         self.focus_path(hwnd, next_path, &neighbors);
     }
 
+    fn dpi_scale(&self) -> f32 {
+        (self.dpi.max(96) as f32) / 96.0
+    }
+
+    fn enter_edit_mode(&mut self, hwnd: HWND, tab: EditTab) {
+        let (Some(img), Some(path)) = (self.current_image.as_ref(), self.focused_path.clone())
+        else {
+            return;
+        };
+        if let Some(ref mut s) = self.edit {
+            s.tab = tab;
+            invalidate(hwnd);
+            return;
+        }
+        // Evict neighbor cache entries immediately so Edit Mode stays strictly within the RAM budget.
+        self.store.enter_edit_mode(&path);
+        self.show_help = false;
+        self.dragging = false;
+        self.compare_via_dock = false;
+        self.kill_anim_timer(hwnd);
+
+        let is_anim = img.is_animated();
+        let total_frames = img.frames.len().max(1);
+        let frame_idx = self.frame_index.min(total_frames - 1);
+        self.edit = Some(EditSession::new(tab, is_anim, frame_idx, total_frames));
+        self.update_title(hwnd);
+        invalidate(hwnd);
+    }
+
+    fn exit_edit_mode(&mut self, hwnd: HWND) {
+        self.edit = None;
+        self.compare_via_dock = false;
+        self.last_slider_click = None;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_edit_resources();
+        }
+        self.sync_animation_timer(hwnd);
+        self.update_title(hwnd);
+        invalidate(hwnd);
+    }
+
+    fn edit_geometry(&self, session: &EditSession) -> Option<(DockLayout, Rect, f32, (u32, u32))> {
+        let img = self.current_image.as_ref()?;
+        let scale = self.dpi_scale();
+        let layout = DockLayout::compute(self.client_size.0, self.client_size.1, scale, session);
+        let src = (img.source_width.max(1), img.source_height.max(1));
+        let oriented = if session.comparing_original {
+            src
+        } else {
+            session.recipe().oriented_dims(src.0, src.1)
+        };
+        let (image_dest, image_scale) =
+            edit_image_dest_rect(oriented, self.client_size, layout.reserved_bottom_px, scale);
+        Some((layout, image_dest, image_scale, src))
+    }
+
+    fn request_smart_save(&mut self, hwnd: HWND) {
+        let Some(ref path) = self.focused_path else {
+            return;
+        };
+        let (is_dirty, is_anim, orient_only, exporting) = match self.edit.as_ref() {
+            Some(s) => (
+                s.is_dirty(),
+                s.is_animated_source,
+                s.recipe().is_orientation_only(),
+                s.exporting,
+            ),
+            None => return,
+        };
+        if exporting {
+            return;
+        }
+        if !is_dirty {
+            self.show_toast(hwnd, "No changes to save".to_string());
+            return;
+        }
+        if is_anim || !supports_in_place_overwrite(path, is_anim) {
+            self.start_export(hwnd, true);
+            return;
+        }
+        if orient_only && ImageFormat::from_path(path) == Some(ImageFormat::Jpeg) {
+            self.start_export(hwnd, false);
+            return;
+        }
+        if let Some(ref mut s) = self.edit {
+            s.prompt = EditPrompt::SaveChoice;
+            invalidate(hwnd);
+        }
+    }
+
+    fn start_export(&mut self, hwnd: HWND, save_copy: bool) {
+        let Some(path) = self.focused_path.clone() else {
+            return;
+        };
+        let (recipe, quality, frame_index) = match self.edit.as_mut() {
+            Some(s) => {
+                if s.exporting {
+                    return;
+                }
+                if !s.is_dirty() {
+                    self.show_toast(hwnd, "No changes to save".to_string());
+                    return;
+                }
+                s.prompt = EditPrompt::None;
+                s.exporting = true;
+                (s.recipe(), s.quality.quality(), s.frame_index)
+            }
+            None => return,
+        };
+
+        self.store.trim_for_export();
+        self.show_toast(hwnd, "Saving…".to_string());
+
+        let out_slot = Arc::clone(&self.export_result);
+        let hwnd_slot = Arc::clone(&self.hwnd_slot);
+        let _ = std::thread::Builder::new()
+            .name("kalux-export".to_string())
+            .spawn(move || {
+                let res = export_image(
+                    &path,
+                    &recipe,
+                    ExportOptions {
+                        jpeg_quality: quality,
+                        save_copy,
+                        format_override: None,
+                    },
+                    frame_index,
+                );
+                if let Ok(mut guard) = out_slot.lock() {
+                    *guard = Some(ExportOutcome {
+                        save_copy,
+                        result: res,
+                    });
+                }
+                let raw = hwnd_slot.load(Ordering::Acquire);
+                if raw != 0 {
+                    let target = HWND(raw as *mut c_void);
+                    // SAFETY: `raw` is cleared in `WM_DESTROY`; `PostMessageW` is thread-safe.
+                    let _ = unsafe {
+                        PostMessageW(Some(target), WM_APP_EXPORT_DONE, WPARAM(0), LPARAM(0))
+                    };
+                }
+            });
+    }
+
+    fn handle_export_done(&mut self, hwnd: HWND) {
+        let outcome = self
+            .export_result
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(outcome) = outcome else {
+            return;
+        };
+
+        match outcome.result {
+            Ok(res) => {
+                let saved_path = res.saved_path.clone();
+                let fname = display_file_name(&saved_path);
+                let msg = if res.lossless {
+                    "Saved lossless".to_string()
+                } else if res.redirected_to_copy {
+                    format!("Saved copy: {fname}")
+                } else if outcome.save_copy {
+                    format!("Saved {fname}")
+                } else {
+                    "Saved".to_string()
+                };
+
+                self.exit_edit_mode(hwnd);
+                let neighbors = if outcome.save_copy || res.redirected_to_copy {
+                    if let Some(ref mut pl) = self.playlist {
+                        pl.insert_and_select(saved_path.clone());
+                        pl.neighbors(self.preload_radius)
+                    } else {
+                        self.playlist = Some(Playlist::single(saved_path.clone()));
+                        Vec::new()
+                    }
+                } else {
+                    self.store.trim_for_export();
+                    self.playlist
+                        .as_ref()
+                        .map(|pl| pl.neighbors(self.preload_radius))
+                        .unwrap_or_default()
+                };
+                self.focus_path(hwnd, saved_path, &neighbors);
+                self.show_toast(hwnd, msg);
+            }
+            Err(err) => {
+                if let Some(ref mut s) = self.edit {
+                    s.exporting = false;
+                }
+                self.show_toast(hwnd, format!("Save failed: {err}"));
+            }
+        }
+    }
+
+    fn start_clipboard_copy(&mut self, hwnd: HWND) {
+        let Some(path) = self.focused_path.clone() else {
+            return;
+        };
+        let (recipe, frame_index) = match self.edit.as_ref() {
+            Some(s) => (s.recipe(), s.frame_index),
+            None => (Default::default(), self.frame_index),
+        };
+        self.show_toast(hwnd, "Copying…".to_string());
+
+        let out_slot = Arc::clone(&self.clipboard_result);
+        let hwnd_slot = Arc::clone(&self.hwnd_slot);
+        let _ = std::thread::Builder::new()
+            .name("kalux-clip".to_string())
+            .spawn(move || {
+                let res =
+                    render_edited_image(&path, &recipe, frame_index).map_err(|e| e.to_string());
+                if let Ok(mut guard) = out_slot.lock() {
+                    *guard = Some(res);
+                }
+                let raw = hwnd_slot.load(Ordering::Acquire);
+                if raw != 0 {
+                    let target = HWND(raw as *mut c_void);
+                    // SAFETY: `raw` is cleared in `WM_DESTROY`; `PostMessageW` is thread-safe.
+                    let _ = unsafe {
+                        PostMessageW(Some(target), WM_APP_CLIPBOARD_DONE, WPARAM(0), LPARAM(0))
+                    };
+                }
+            });
+    }
+
+    fn handle_clipboard_done(&mut self, hwnd: HWND) {
+        let item = self
+            .clipboard_result
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(res) = item else {
+            return;
+        };
+        match res {
+            Ok(img) => match copy_image_to_win32_clipboard(hwnd, &img) {
+                Ok(()) => self.show_toast(hwnd, "Copied image".to_string()),
+                Err(e) => self.show_toast(hwnd, format!("Copy failed: {e}")),
+            },
+            Err(e) => self.show_toast(hwnd, format!("Copy failed: {e}")),
+        }
+    }
+
+    fn launch_kapix(&mut self, hwnd: HWND) {
+        let Some(ref path) = self.focused_path else {
+            return;
+        };
+        match std::process::Command::new("kapix").arg(path).spawn() {
+            Ok(_) => self.show_toast(hwnd, "Opened in Kapix".to_string()),
+            Err(_) => self.show_toast(hwnd, "Kapix not found in PATH".to_string()),
+        }
+    }
+
+    fn handle_edit_action(&mut self, hwnd: HWND, action: EditAction) {
+        let Some(src) = self.current_source_size() else {
+            return;
+        };
+        let prompt = match self.edit.as_ref() {
+            Some(s) => s.prompt,
+            None => return,
+        };
+
+        if prompt != EditPrompt::None {
+            match action {
+                EditAction::ConfirmPrimary => {
+                    self.start_export(hwnd, true);
+                    return;
+                }
+                EditAction::ConfirmOverwrite if prompt == EditPrompt::SaveChoice => {
+                    self.start_export(hwnd, false);
+                    return;
+                }
+                EditAction::ConfirmDiscard if prompt == EditPrompt::UnsavedExit => {
+                    self.exit_edit_mode(hwnd);
+                    return;
+                }
+                EditAction::ExitOrCancel => {
+                    if let Some(ref mut s) = self.edit {
+                        s.prompt = EditPrompt::None;
+                        invalidate(hwnd);
+                    }
+                    return;
+                }
+                EditAction::CloseWindow => {
+                    // SAFETY: `hwnd` is valid.
+                    let _ = unsafe { DestroyWindow(hwnd) };
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        match action {
+            EditAction::TabCrop => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Crop;
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::TabAdjust => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Adjust;
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::RotateCw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_cw();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::RotateCcw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_ccw();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::FlipH => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_h();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::FlipV => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_v();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::SwapAspect => {
+                if let Some(ref mut s) = self.edit {
+                    s.swap_aspect(src.0, src.1);
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::ToggleMonochrome => {
+                if let Some(ref mut s) = self.edit {
+                    s.toggle_monochrome();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::NudgeCrop(dx, dy, resize) => {
+                if let Some(ref mut s) = self.edit {
+                    s.nudge_crop(dx, dy, resize, src.0, src.1);
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::Undo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.undo().is_some()
+                {
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::Redo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.redo().is_some()
+                {
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            EditAction::ResetAll => {
+                if let Some(ref mut s) = self.edit {
+                    s.reset_all();
+                    self.update_title(hwnd);
+                    self.show_toast(hwnd, "Reset edits".to_string());
+                }
+            }
+            EditAction::CopyEdited => {
+                self.start_clipboard_copy(hwnd);
+            }
+            EditAction::SmartSave | EditAction::ConfirmPrimary => {
+                self.request_smart_save(hwnd);
+            }
+            EditAction::SaveCopy => {
+                self.start_export(hwnd, true);
+            }
+            EditAction::ConfirmOverwrite | EditAction::ConfirmDiscard => {}
+            EditAction::EditInKapix => {
+                self.launch_kapix(hwnd);
+            }
+            EditAction::ExitOrCancel => {
+                let is_dirty = self.edit.as_ref().is_some_and(EditSession::is_dirty);
+                if is_dirty {
+                    if let Some(ref mut s) = self.edit {
+                        s.prompt = EditPrompt::UnsavedExit;
+                        invalidate(hwnd);
+                    }
+                } else {
+                    self.exit_edit_mode(hwnd);
+                }
+            }
+            EditAction::CloseWindow => {
+                // SAFETY: `hwnd` is valid.
+                let _ = unsafe { DestroyWindow(hwnd) };
+            }
+        }
+    }
+
+    fn handle_dock_button(
+        &mut self,
+        hwnd: HWND,
+        button: DockButton,
+        phys: (f32, f32),
+        layout: &DockLayout,
+        src: (u32, u32),
+    ) {
+        let scale = self.dpi_scale();
+        match button {
+            DockButton::TabCrop => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Crop;
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::TabAdjust => {
+                if let Some(ref mut s) = self.edit {
+                    s.tab = EditTab::Adjust;
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::Aspect(preset) => {
+                if let Some(ref mut s) = self.edit {
+                    s.set_aspect(preset, src.0, src.1);
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::SwapAspect => {
+                if let Some(ref mut s) = self.edit {
+                    s.swap_aspect(src.0, src.1);
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::RotateCcw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_ccw();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::RotateCw => {
+                if let Some(ref mut s) = self.edit {
+                    s.rotate_cw();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::FlipH => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_h();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::FlipV => {
+                if let Some(ref mut s) = self.edit {
+                    s.flip_v();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::Slider(slider) => {
+                let now = Instant::now();
+                let is_double = self.last_slider_click.is_some_and(|(t, prev)| {
+                    prev == slider && now.duration_since(t) <= DOUBLE_CLICK_MAX_GAP
+                });
+                if is_double {
+                    self.last_slider_click = None;
+                    if let Some(ref mut s) = self.edit {
+                        let mut r = s.recipe();
+                        r.tone.set(slider, 0.0);
+                        s.history.push(r);
+                        self.update_title(hwnd);
+                        invalidate(hwnd);
+                    }
+                    return;
+                }
+                self.last_slider_click = Some((now, slider));
+                if let (Some(ref mut s), Some(rect)) = (
+                    self.edit.as_mut(),
+                    layout.rect_of(DockButton::Slider(slider)),
+                ) {
+                    let start_recipe = s.recipe();
+                    let val = DockLayout::slider_value_at(rect, scale, phys.0);
+                    s.drag = Some(EditDrag::Slider {
+                        slider,
+                        start_recipe,
+                    });
+                    s.history.current_mut().tone.set(slider, val);
+                    // SAFETY: `hwnd` is valid; paired with `ReleaseCapture` on button up.
+                    unsafe { SetCapture(hwnd) };
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::Monochrome => {
+                if let Some(ref mut s) = self.edit {
+                    s.toggle_monochrome();
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::Reset => {
+                if let Some(ref mut s) = self.edit {
+                    s.reset_all();
+                    self.update_title(hwnd);
+                    self.show_toast(hwnd, "Reset edits".to_string());
+                }
+            }
+            DockButton::Compare => {
+                if let Some(ref mut s) = self.edit {
+                    s.comparing_original = true;
+                    self.compare_via_dock = true;
+                    // SAFETY: `hwnd` is valid; paired with `ReleaseCapture` on button up.
+                    unsafe { SetCapture(hwnd) };
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::Undo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.undo().is_some()
+                {
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::Redo => {
+                if let Some(ref mut s) = self.edit
+                    && s.history.redo().is_some()
+                {
+                    self.update_title(hwnd);
+                    invalidate(hwnd);
+                }
+            }
+            DockButton::QualityCycle => {
+                if let Some(ref mut s) = self.edit {
+                    s.quality = s.quality.cycle();
+                    let label = format!("JPEG quality {}", s.quality.quality());
+                    self.show_toast(hwnd, label);
+                }
+            }
+            DockButton::CopyEdited => {
+                self.start_clipboard_copy(hwnd);
+            }
+            DockButton::SaveOverwrite => {
+                self.request_smart_save(hwnd);
+            }
+            DockButton::SaveCopy => {
+                self.start_export(hwnd, true);
+            }
+            DockButton::Done => {
+                self.handle_edit_action(hwnd, EditAction::ExitOrCancel);
+            }
+            DockButton::PromptSaveCopy => {
+                self.start_export(hwnd, true);
+            }
+            DockButton::PromptOverwrite => {
+                self.start_export(hwnd, false);
+            }
+            DockButton::PromptDiscard => {
+                self.exit_edit_mode(hwnd);
+            }
+            DockButton::PromptCancel => {
+                if let Some(ref mut s) = self.edit {
+                    s.prompt = EditPrompt::None;
+                    invalidate(hwnd);
+                }
+            }
+        }
+    }
+
+    fn handle_edit_mouse_down(&mut self, hwnd: HWND, lp: LPARAM) {
+        let phys = (
+            input::get_x_lparam(lp) as f32,
+            input::get_y_lparam(lp) as f32,
+        );
+        let scale = self.dpi_scale();
+
+        let Some(session_snap) = self.edit.as_ref() else {
+            return;
+        };
+        let Some((layout, image_dest, _, src)) = self.edit_geometry(session_snap) else {
+            return;
+        };
+
+        if let Some(btn) = layout.hit_test(phys) {
+            self.handle_dock_button(hwnd, btn, phys, &layout, src);
+            return;
+        }
+        if layout.contains_point(phys) {
+            return;
+        }
+
+        if let Some(ref mut s) = self.edit {
+            if s.prompt != EditPrompt::None {
+                s.prompt = EditPrompt::None;
+                invalidate(hwnd);
+                return;
+            }
+
+            let crop_screen = s.recipe().crop.to_screen_rect(image_dest);
+            if let Some(handle) = hit_test_crop(phys, crop_screen, 10.0 * scale) {
+                let start_norm = (
+                    (phys.0 - image_dest.x) / image_dest.w.max(1.0),
+                    (phys.1 - image_dest.y) / image_dest.h.max(1.0),
+                );
+                let start_recipe = s.recipe();
+                s.drag = Some(EditDrag::CropHandle {
+                    handle,
+                    start_recipe,
+                    start_norm,
+                });
+                // SAFETY: `hwnd` is valid; paired with `ReleaseCapture` on button up.
+                unsafe { SetCapture(hwnd) };
+                invalidate(hwnd);
+            } else if phys.0 >= image_dest.x
+                && phys.0 <= image_dest.x + image_dest.w
+                && phys.1 >= image_dest.y
+                && phys.1 <= image_dest.y + image_dest.h
+            {
+                let anchor_norm = (
+                    ((phys.0 - image_dest.x) / image_dest.w.max(1.0)).clamp(0.0, 1.0),
+                    ((phys.1 - image_dest.y) / image_dest.h.max(1.0)).clamp(0.0, 1.0),
+                );
+                let start_recipe = s.recipe();
+                s.drag = Some(EditDrag::NewCrop {
+                    start_recipe,
+                    anchor_norm,
+                });
+                // SAFETY: `hwnd` is valid; paired with `ReleaseCapture` on button up.
+                unsafe { SetCapture(hwnd) };
+                invalidate(hwnd);
+            }
+        }
+    }
+
+    fn handle_edit_mouse_move(&mut self, hwnd: HWND, lp: LPARAM) {
+        let phys = (
+            input::get_x_lparam(lp) as f32,
+            input::get_y_lparam(lp) as f32,
+        );
+        let scale = self.dpi_scale();
+        let shift_held = input::current_modifiers().shift;
+
+        let Some(session_snap) = self.edit.as_ref() else {
+            return;
+        };
+        let Some((layout, image_dest, _, src)) = self.edit_geometry(session_snap) else {
+            return;
+        };
+
+        let Some(ref mut session) = self.edit else {
+            return;
+        };
+
+        if let Some(drag) = session.drag {
+            match drag {
+                EditDrag::Slider { slider, .. } => {
+                    if let Some(rect) = layout.rect_of(DockButton::Slider(slider)) {
+                        let val = DockLayout::slider_value_at(rect, scale, phys.0);
+                        session.history.current_mut().tone.set(slider, val);
+                        invalidate(hwnd);
+                    }
+                }
+                EditDrag::CropHandle {
+                    handle,
+                    start_recipe,
+                    start_norm,
+                } => {
+                    if image_dest.w > 1.0 && image_dest.h > 1.0 {
+                        let cur_u = (phys.0 - image_dest.x) / image_dest.w;
+                        let cur_v = (phys.1 - image_dest.y) / image_dest.h;
+                        let dx = cur_u - start_norm.0;
+                        let dy = cur_v - start_norm.1;
+                        let (ow, oh) = start_recipe.oriented_dims(src.0, src.1);
+                        let locked = session.effective_aspect_ratio(src.0, src.1, shift_held);
+                        let next_crop =
+                            start_recipe.crop.apply_drag(handle, dx, dy, locked, ow, oh);
+                        session.history.current_mut().crop = next_crop;
+                        invalidate(hwnd);
+                    }
+                }
+                EditDrag::NewCrop {
+                    start_recipe,
+                    anchor_norm,
+                } => {
+                    if image_dest.w > 1.0 && image_dest.h > 1.0 {
+                        let cur_u = ((phys.0 - image_dest.x) / image_dest.w).clamp(0.0, 1.0);
+                        let cur_v = ((phys.1 - image_dest.y) / image_dest.h).clamp(0.0, 1.0);
+                        let x0 = anchor_norm.0.min(cur_u);
+                        let y0 = anchor_norm.1.min(cur_v);
+                        let w = (cur_u - anchor_norm.0).abs();
+                        let h = (cur_v - anchor_norm.1).abs();
+                        let (ow, oh) = start_recipe.oriented_dims(src.0, src.1);
+                        let (min_w, min_h) = CropRect::min_norm_for(ow, oh);
+                        let mut rect = CropRect { x: x0, y: y0, w, h }.clamped(min_w, min_h);
+                        if let Some(ratio) =
+                            session.effective_aspect_ratio(src.0, src.1, shift_held)
+                        {
+                            rect = rect.fit_aspect(ratio, ow, oh);
+                        }
+                        session.history.current_mut().crop = rect;
+                        invalidate(hwnd);
+                    }
+                }
+            }
+            return;
+        }
+
+        let hovered_btn = layout.hit_test(phys);
+        let hovered_handle = if hovered_btn.is_none()
+            && !layout.contains_point(phys)
+            && session.prompt == EditPrompt::None
+        {
+            let crop_screen = session.recipe().crop.to_screen_rect(image_dest);
+            hit_test_crop(phys, crop_screen, 10.0 * scale)
+        } else {
+            None
+        };
+
+        if hovered_btn != session.hovered_button || hovered_handle != session.hovered_handle {
+            session.hovered_button = hovered_btn;
+            session.hovered_handle = hovered_handle;
+            invalidate(hwnd);
+        }
+    }
+
+    fn handle_edit_mouse_up(&mut self, hwnd: HWND) {
+        let mut had_capture = false;
+        if self.compare_via_dock {
+            self.compare_via_dock = false;
+            had_capture = true;
+            if let Some(ref mut s) = self.edit {
+                s.comparing_original = false;
+            }
+        }
+        if let Some(ref mut s) = self.edit
+            && let Some(drag) = s.drag.take()
+        {
+            had_capture = true;
+            let start_recipe = match drag {
+                EditDrag::CropHandle { start_recipe, .. }
+                | EditDrag::NewCrop { start_recipe, .. }
+                | EditDrag::Slider { start_recipe, .. } => start_recipe,
+            };
+            let after = s.recipe();
+            s.history.commit_from(start_recipe, after);
+        }
+        if had_capture {
+            // SAFETY: Releases capture set during drag/compare press.
+            let _ = unsafe { ReleaseCapture() };
+            self.update_title(hwnd);
+            invalidate(hwnd);
+        }
+    }
+
+    fn apply_edit_cursor(&self) -> bool {
+        let Some(ref s) = self.edit else {
+            return false;
+        };
+        let cursor_id = if let Some(drag) = s.drag {
+            match drag {
+                EditDrag::Slider { .. } => IDC_HAND,
+                EditDrag::NewCrop { .. } => IDC_CROSS,
+                EditDrag::CropHandle { handle, .. } => cursor_for_handle(handle),
+            }
+        } else if s.hovered_button.is_some() {
+            IDC_HAND
+        } else if let Some(handle) = s.hovered_handle {
+            cursor_for_handle(handle)
+        } else {
+            IDC_ARROW
+        };
+        // SAFETY: Loading standard system cursor and applying it inside `WM_SETCURSOR`.
+        if let Ok(hcur) = unsafe { LoadCursorW(None, cursor_id) } {
+            unsafe {
+                let _ = SetCursor(Some(hcur));
+            }
+            return true;
+        }
+        false
+    }
+
     fn handle_action(&mut self, hwnd: HWND, action: Action) {
         match action {
             Action::Next => self.navigate(hwnd, NavTarget::Delta(1)),
@@ -602,23 +1443,25 @@ impl AppState {
                 self.show_help = !self.show_help;
                 invalidate(hwnd);
             }
-            Action::RotateCw | Action::RotateCcw => {
-                self.show_toast(hwnd, "Rotate — coming in v0.2".to_string());
+            Action::EditMode | Action::CropMode => {
+                self.enter_edit_mode(hwnd, EditTab::Crop);
             }
-            Action::ToggleInfo => {
-                self.show_toast(hwnd, "Info panel — coming in v0.2".to_string());
+            Action::RotateCw => {
+                self.enter_edit_mode(hwnd, EditTab::Crop);
+                self.handle_edit_action(hwnd, EditAction::RotateCw);
             }
-            Action::Delete => {
-                self.show_toast(hwnd, "Recycle Bin delete — coming in v0.2".to_string());
+            Action::RotateCcw => {
+                self.enter_edit_mode(hwnd, EditTab::Crop);
+                self.handle_edit_action(hwnd, EditAction::RotateCcw);
             }
             Action::CopyImage => {
-                self.show_toast(hwnd, "Copy image — coming in v0.2".to_string());
-            }
-            Action::CopyPath => {
-                self.show_toast(hwnd, "Copy path — coming in v0.2".to_string());
+                self.start_clipboard_copy(hwnd);
             }
             Action::EditInKapix => {
-                self.show_toast(hwnd, "Edit in kapix — coming in v0.2".to_string());
+                self.launch_kapix(hwnd);
+            }
+            Action::ToggleInfo | Action::Delete | Action::CopyPath => {
+                self.show_toast(hwnd, "Coming in v0.4".to_string());
             }
         }
     }
@@ -639,6 +1482,9 @@ impl AppState {
     }
 
     fn handle_mouse_wheel(&mut self, hwnd: HWND, wp: WPARAM, lp: LPARAM) {
+        if self.edit.is_some() {
+            return;
+        }
         let Some(source) = self.current_source_size() else {
             return;
         };
@@ -656,6 +1502,10 @@ impl AppState {
     }
 
     fn handle_lbutton_down(&mut self, hwnd: HWND, lp: LPARAM) {
+        if self.edit.is_some() {
+            self.handle_edit_mouse_down(hwnd, lp);
+            return;
+        }
         if self.current_image.is_none() {
             return;
         }
@@ -666,6 +1516,10 @@ impl AppState {
     }
 
     fn handle_mouse_move(&mut self, hwnd: HWND, lp: LPARAM) {
+        if self.edit.is_some() {
+            self.handle_edit_mouse_move(hwnd, lp);
+            return;
+        }
         if !self.dragging {
             return;
         }
@@ -684,7 +1538,11 @@ impl AppState {
         }
     }
 
-    fn handle_lbutton_up(&mut self) {
+    fn handle_lbutton_up(&mut self, hwnd: HWND) {
+        if self.edit.is_some() {
+            self.handle_edit_mouse_up(hwnd);
+            return;
+        }
         if self.dragging {
             self.dragging = false;
             // SAFETY: Releases capture previously set by `SetCapture`.
@@ -936,16 +1794,35 @@ impl AppState {
             error: self.error.as_ref(),
             loading_label: self.loading_label.as_deref(),
             toast: self.toast.as_deref(),
-            show_help: self.show_help,
+            show_help: self.show_help && self.edit.is_none(),
         };
 
+        let edit_geo = self.edit.as_ref().and_then(|s| self.edit_geometry(s));
+
         let presented_image = if let Some(renderer) = self.renderer.as_mut() {
+            let edit_view = match (self.edit.as_ref(), edit_geo.as_ref()) {
+                (Some(session), Some((layout, image_dest, image_scale, source_dims))) => {
+                    Some(EditRenderView {
+                        session,
+                        layout,
+                        image_dest: *image_dest,
+                        image_scale: *image_scale,
+                        source_dims: *source_dims,
+                    })
+                }
+                _ => None,
+            };
+            let frame_idx = self
+                .edit
+                .as_ref()
+                .map_or(self.frame_index, |s| s.frame_index);
             renderer.render(
                 dest,
                 self.view.scale,
-                self.frame_index,
+                frame_idx,
                 self.dpi,
                 &overlay_view,
+                edit_view.as_ref(),
             )
         } else {
             false
@@ -977,13 +1854,18 @@ impl AppState {
     }
 
     fn update_title(&self, hwnd: HWND) {
+        let edit_suffix = match self.edit.as_ref() {
+            Some(s) if s.is_dirty() => " \u{2014} Editing*",
+            Some(_) => " \u{2014} Editing",
+            None => "",
+        };
         let title = match (&self.playlist, &self.current_image) {
             (Some(pl), Some(img)) if self.loading_label.is_none() => {
                 let name = display_file_name(pl.current());
                 let idx = pl.index() + 1;
                 let total = pl.len();
                 format!(
-                    "{name} \u{2014} {idx} / {total} \u{2014} {}\u{00D7}{} \u{2014} Kalux",
+                    "{name} \u{2014} {idx} / {total} \u{2014} {}\u{00D7}{}{edit_suffix} \u{2014} Kalux",
                     img.source_width, img.source_height
                 )
             }
@@ -991,7 +1873,7 @@ impl AppState {
                 let name = display_file_name(pl.current());
                 let idx = pl.index() + 1;
                 let total = pl.len();
-                format!("{name} \u{2014} {idx} / {total} \u{2014} Kalux")
+                format!("{name} \u{2014} {idx} / {total}{edit_suffix} \u{2014} Kalux")
             }
             (None, _) => "Kalux".to_string(),
         };
@@ -1063,6 +1945,16 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_APP_EXPORT_DONE => {
+            state.handle_export_done(hwnd);
+            LRESULT(0)
+        }
+
+        WM_APP_CLIPBOARD_DONE => {
+            state.handle_clipboard_done(hwnd);
+            LRESULT(0)
+        }
+
         WM_SIZE => {
             state.handle_size(hwnd, wparam, lparam);
             LRESULT(0)
@@ -1085,11 +1977,51 @@ unsafe extern "system" fn wnd_proc(
         }
 
         WM_KEYDOWN => {
+            if state.edit.is_some() {
+                if input::vk_from_wparam(wparam) == VK_COMPARE {
+                    if let Some(ref mut s) = state.edit
+                        && !s.comparing_original
+                    {
+                        s.comparing_original = true;
+                        invalidate(hwnd);
+                    }
+                    return LRESULT(0);
+                }
+                if let Some(action) = input::edit_action_from_keydown(wparam) {
+                    state.handle_edit_action(hwnd, action);
+                    return LRESULT(0);
+                }
+                return LRESULT(0);
+            }
             if let Some(action) = input::action_from_keydown(wparam) {
                 state.handle_action(hwnd, action);
                 return LRESULT(0);
             }
             // SAFETY: Unhandled keys go to `DefWindowProcW`.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_KEYUP => {
+            if state.edit.is_some() && input::vk_from_wparam(wparam) == VK_COMPARE {
+                if let Some(ref mut s) = state.edit
+                    && s.comparing_original
+                    && !state.compare_via_dock
+                {
+                    s.comparing_original = false;
+                    invalidate(hwnd);
+                }
+                return LRESULT(0);
+            }
+            // SAFETY: Unhandled key-up goes to `DefWindowProcW`.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_SETCURSOR => {
+            let hit_area = (lparam.0 & 0xFFFF) as u32;
+            if hit_area == HTCLIENT && state.apply_edit_cursor() {
+                return LRESULT(1);
+            }
+            // SAFETY: Let Windows set default non-client/viewer cursor.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
@@ -1109,21 +2041,32 @@ unsafe extern "system" fn wnd_proc(
         }
 
         WM_LBUTTONUP => {
-            state.handle_lbutton_up();
+            state.handle_lbutton_up(hwnd);
             LRESULT(0)
         }
 
         WM_CAPTURECHANGED => {
             state.dragging = false;
+            if state.edit.is_some() {
+                state.handle_edit_mouse_up(hwnd);
+            }
             LRESULT(0)
         }
 
         WM_LBUTTONDBLCLK => {
-            state.toggle_fullscreen(hwnd);
+            if state.edit.is_some() {
+                // Forward double-clicks inside Edit Mode so double-clicking sliders resets them.
+                state.handle_lbutton_down(hwnd, lparam);
+            } else {
+                state.toggle_fullscreen(hwnd);
+            }
             LRESULT(0)
         }
 
         WM_XBUTTONDOWN => {
+            if state.edit.is_some() {
+                return LRESULT(1);
+            }
             if let Some(action) = input::action_from_xbutton(wparam) {
                 state.handle_action(hwnd, action);
                 // Win32 requires returning TRUE (1) when handling `WM_XBUTTONDOWN`.
@@ -1177,6 +2120,120 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
     }
+}
+
+fn cursor_for_handle(handle: CropHandle) -> PCWSTR {
+    match handle {
+        CropHandle::Nw | CropHandle::Se => IDC_SIZENWSE,
+        CropHandle::Ne | CropHandle::Sw => IDC_SIZENESW,
+        CropHandle::N | CropHandle::S => IDC_SIZENS,
+        CropHandle::E | CropHandle::W => IDC_SIZEWE,
+        CropHandle::Move => IDC_SIZEALL,
+    }
+}
+
+fn copy_image_to_win32_clipboard(hwnd: HWND, img: &DecodedImage) -> Result<(), String> {
+    let frame = img
+        .frames
+        .first()
+        .ok_or_else(|| "image has no frames".to_string())?;
+    let w = img.width as usize;
+    let h = img.height as usize;
+    let row_bytes = w
+        .checked_mul(4)
+        .ok_or_else(|| "image dimensions overflow".to_string())?;
+    let pixel_bytes = row_bytes
+        .checked_mul(h)
+        .ok_or_else(|| "image byte size overflow".to_string())?;
+    if frame.pixels.len() < pixel_bytes || w == 0 || h == 0 {
+        return Err("invalid image buffer".to_string());
+    }
+
+    let hdr_size = size_of::<BITMAPINFOHEADER>();
+    let total_bytes = hdr_size
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| "DIB size overflow".to_string())?;
+
+    let header = BITMAPINFOHEADER {
+        biSize: hdr_size as u32,
+        biWidth: i32::try_from(img.width).map_err(|_| "width exceeds i32")?,
+        biHeight: i32::try_from(img.height).map_err(|_| "height exceeds i32")?,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        biSizeImage: u32::try_from(pixel_bytes).unwrap_or(0),
+        ..Default::default()
+    };
+
+    // SAFETY: Allocating `total_bytes` of moveable global memory for `SetClipboardData(CF_DIB)`.
+    let hmem: HGLOBAL = unsafe { GlobalAlloc(GMEM_MOVEABLE, total_bytes) }
+        .map_err(|e| format!("GlobalAlloc failed: {e}"))?;
+
+    // SAFETY: `hmem` is a valid non-null handle returned by `GlobalAlloc`.
+    let dst_ptr = unsafe { GlobalLock(hmem) } as *mut u8;
+    if dst_ptr.is_null() {
+        // SAFETY: Free unowned `hmem` on lock failure.
+        let _ = unsafe { GlobalFree(Some(hmem)) };
+        return Err("GlobalLock failed".to_string());
+    }
+
+    // SAFETY: `dst_ptr` points to `total_bytes` writable bytes; write header + bottom-up BGRX rows.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&header as *const BITMAPINFOHEADER).cast::<u8>(),
+            dst_ptr,
+            hdr_size,
+        );
+        let pixel_dst = std::slice::from_raw_parts_mut(dst_ptr.add(hdr_size), pixel_bytes);
+        for y in 0..h {
+            let src_row = &frame.pixels[(h - 1 - y) * row_bytes..(h - y) * row_bytes];
+            let dst_row = &mut pixel_dst[y * row_bytes..(y + 1) * row_bytes];
+            for (spx, dpx) in src_row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst_row.as_chunks_mut::<4>().0.iter_mut())
+            {
+                let a = spx[3];
+                if a == 255 {
+                    dpx[0] = spx[0];
+                    dpx[1] = spx[1];
+                    dpx[2] = spx[2];
+                    dpx[3] = 255;
+                } else {
+                    // Composite premultiplied BGRA onto white for opaque 32-bit CF_DIB targets.
+                    let inv = 255u8.saturating_sub(a);
+                    dpx[0] = spx[0].saturating_add(inv);
+                    dpx[1] = spx[1].saturating_add(inv);
+                    dpx[2] = spx[2].saturating_add(inv);
+                    dpx[3] = 255;
+                }
+            }
+        }
+        let _ = GlobalUnlock(hmem);
+    }
+
+    // SAFETY: Opening clipboard for `hwnd`; paired with `CloseClipboard` on every path.
+    if let Err(e) = unsafe { OpenClipboard(Some(hwnd)) } {
+        // SAFETY: Clipboard was not opened; free `hmem`.
+        let _ = unsafe { GlobalFree(Some(hmem)) };
+        return Err(format!("OpenClipboard failed: {e}"));
+    }
+
+    // SAFETY: Clipboard is open on the calling thread.
+    let set_res = unsafe {
+        let _ = EmptyClipboard();
+        SetClipboardData(CF_DIB, Some(HANDLE(hmem.0)))
+    };
+    // SAFETY: Always close the clipboard after `OpenClipboard`.
+    let _ = unsafe { CloseClipboard() };
+
+    if let Err(e) = set_res {
+        // SAFETY: `SetClipboardData` failed, so ownership remains ours and we must free `hmem`.
+        let _ = unsafe { GlobalFree(Some(hmem)) };
+        return Err(format!("SetClipboardData failed: {e}"));
+    }
+    Ok(())
 }
 
 fn system_palette() -> Palette {

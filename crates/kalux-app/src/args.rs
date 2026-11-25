@@ -6,6 +6,13 @@ use std::path::PathBuf;
 /// Maximum test image dimension accepted by `--gen-test-image` to avoid absurd allocations.
 const MAX_TEST_DIM: u32 = 32_768;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenshotEditMode {
+    None,
+    Crop,
+    Adjust,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Open an optional image file in the GUI window.
@@ -14,18 +21,21 @@ pub enum Command {
     Version,
     /// Run the normal GUI startup path, emit one JSON timing/memory line, and exit 0.
     BenchStartup { file: PathBuf, out: Option<PathBuf> },
-    /// Generate a deterministic non-trivial test JPEG via WIC and exit 0.
+    /// Measure Edit Mode active RAM, scrub frame time, export peak RAM + latency, and settled RAM.
+    BenchEdit { file: PathBuf, out: Option<PathBuf> },
+    /// Generate a deterministic non-trivial test JPEG via WIC/jpeg-encoder and exit 0.
     GenTestImage {
         out: PathBuf,
         width: u32,
         height: u32,
     },
-    /// Render an offscreen PNG screenshot of Kalux showing `image` (Direct2D + DirectWrite).
+    /// Render an offscreen PNG screenshot of Kalux showing `image`.
     Screenshot {
         image: PathBuf,
         out: PathBuf,
         light: bool,
         show_help: bool,
+        edit_mode: ScreenshotEditMode,
         toast: Option<String>,
         title: Option<String>,
         width: u32,
@@ -73,7 +83,8 @@ where
     if let Some(flag) = first.to_str() {
         match flag {
             "--version" | "-V" => return Ok(Command::Version),
-            "--bench-startup" => return parse_bench_startup(iter),
+            "--bench-startup" => return parse_bench_file(iter, false),
+            "--bench-edit" => return parse_bench_file(iter, true),
             "--gen-test-image" => return parse_gen_test_image(iter),
             "--screenshot" => return parse_screenshot(iter),
             "--" => {
@@ -92,7 +103,15 @@ where
     })
 }
 
-fn parse_bench_startup(mut iter: impl Iterator<Item = OsString>) -> Result<Command, ArgError> {
+fn parse_bench_file(
+    mut iter: impl Iterator<Item = OsString>,
+    is_edit: bool,
+) -> Result<Command, ArgError> {
+    let flag_name = if is_edit {
+        "--bench-edit"
+    } else {
+        "--bench-startup"
+    };
     let mut file: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
 
@@ -117,7 +136,7 @@ fn parse_bench_startup(mut iter: impl Iterator<Item = OsString>) -> Result<Comma
             }
             if s.starts_with("--") {
                 return Err(ArgError::cli(format!(
-                    "Unknown option for --bench-startup: {s}"
+                    "Unknown option for {flag_name}: {s}"
                 )));
             }
         }
@@ -125,16 +144,23 @@ fn parse_bench_startup(mut iter: impl Iterator<Item = OsString>) -> Result<Comma
         if file.is_none() {
             file = Some(PathBuf::from(arg));
         } else {
-            return Err(ArgError::cli(
-                "Unexpected extra argument to --bench-startup",
-            ));
+            return Err(ArgError::cli(format!(
+                "Unexpected extra argument to {flag_name}"
+            )));
         }
     }
 
-    let file = file
-        .ok_or_else(|| ArgError::cli("Usage: kalux --bench-startup <file> [--bench-out <path>]"))?;
+    let file = file.ok_or_else(|| {
+        ArgError::cli(format!(
+            "Usage: kalux {flag_name} <file> [--bench-out <path>]"
+        ))
+    })?;
 
-    Ok(Command::BenchStartup { file, out })
+    if is_edit {
+        Ok(Command::BenchEdit { file, out })
+    } else {
+        Ok(Command::BenchStartup { file, out })
+    }
 }
 
 fn parse_gen_test_image(mut iter: impl Iterator<Item = OsString>) -> Result<Command, ArgError> {
@@ -157,11 +183,12 @@ fn parse_gen_test_image(mut iter: impl Iterator<Item = OsString>) -> Result<Comm
 }
 
 fn parse_screenshot(mut iter: impl Iterator<Item = OsString>) -> Result<Command, ArgError> {
-    let usage = "Usage: kalux --screenshot <image> <out.png> [--light] [--help] [--toast <text>] [--title <text>] [--width <w>] [--height <h>]";
+    let usage = "Usage: kalux --screenshot <image> <out.png> [--light] [--help] [--edit-crop|--edit-adjust] [--toast <text>] [--title <text>] [--width <w>] [--height <h>]";
     let image = iter.next().ok_or_else(|| ArgError::cli(usage))?;
     let out = iter.next().ok_or_else(|| ArgError::cli(usage))?;
     let mut light = false;
     let mut show_help = false;
+    let mut edit_mode = ScreenshotEditMode::None;
     let mut toast: Option<String> = None;
     let mut title: Option<String> = None;
     let mut width: u32 = 1280;
@@ -174,6 +201,8 @@ fn parse_screenshot(mut iter: impl Iterator<Item = OsString>) -> Result<Command,
         match flag {
             "--light" => light = true,
             "--help" => show_help = true,
+            "--edit-crop" => edit_mode = ScreenshotEditMode::Crop,
+            "--edit-adjust" => edit_mode = ScreenshotEditMode::Adjust,
             "--toast" => {
                 let v = iter
                     .next()
@@ -211,6 +240,7 @@ fn parse_screenshot(mut iter: impl Iterator<Item = OsString>) -> Result<Command,
         out: PathBuf::from(out),
         light,
         show_help,
+        edit_mode,
         toast,
         title,
         width,
@@ -317,6 +347,24 @@ mod tests {
     }
 
     #[test]
+    fn bench_edit_variants() {
+        assert_eq!(
+            parse_args(os(&["--bench-edit", "a.jpg"])),
+            Ok(Command::BenchEdit {
+                file: PathBuf::from("a.jpg"),
+                out: None,
+            })
+        );
+        assert_eq!(
+            parse_args(os(&["--bench-edit", "a.jpg", "--bench-out", "edit.jsonl"])),
+            Ok(Command::BenchEdit {
+                file: PathBuf::from("a.jpg"),
+                out: Some(PathBuf::from("edit.jsonl")),
+            })
+        );
+    }
+
+    #[test]
     fn screenshot_variants() {
         assert_eq!(
             parse_args(os(&[
@@ -325,6 +373,7 @@ mod tests {
                 "out.png",
                 "--light",
                 "--help",
+                "--edit-crop",
                 "--toast",
                 "100%",
                 "--title",
@@ -339,6 +388,7 @@ mod tests {
                 out: PathBuf::from("out.png"),
                 light: true,
                 show_help: true,
+                edit_mode: ScreenshotEditMode::Crop,
                 toast: Some("100%".to_string()),
                 title: Some("demo.jpg — Kalux".to_string()),
                 width: 1280,

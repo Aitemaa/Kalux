@@ -9,6 +9,8 @@ mod linux;
 #[cfg(windows)]
 mod bench;
 #[cfg(windows)]
+mod edit_ui;
+#[cfg(windows)]
 mod input;
 #[cfg(windows)]
 mod overlay;
@@ -108,6 +110,7 @@ fn run_windows(main_start: std::time::Instant) -> i32 {
             out,
             light,
             show_help,
+            edit_mode,
             toast,
             title,
             width,
@@ -124,6 +127,7 @@ fn run_windows(main_start: std::time::Instant) -> i32 {
                 out,
                 light,
                 show_help,
+                edit_mode,
                 toast,
                 title,
                 width,
@@ -152,6 +156,23 @@ fn run_windows(main_start: std::time::Instant) -> i32 {
                 initial_error: None,
                 bench: Some(bench),
             })
+        }
+
+        Ok(Command::BenchEdit { file, out }) => {
+            // SAFETY: Initialize COM STA on the main thread for WIC decoding.
+            let com_ok =
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }
+                    .is_ok();
+            let _com = ComGuard(com_ok);
+
+            if let Err(err) = bench::run_edit_bench(&file, out.as_deref()) {
+                attach_console_if_needed();
+                let mut stderr = std::io::stderr().lock();
+                let _ = writeln!(stderr, "kalux: {err}");
+                let _ = stderr.flush();
+                return 1;
+            }
+            0
         }
 
         Ok(Command::Open { file }) => {

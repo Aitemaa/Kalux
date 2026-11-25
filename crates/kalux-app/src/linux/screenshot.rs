@@ -7,9 +7,15 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::PathBuf;
 
-use kalux_core::{Palette, View};
+use kalux_core::edit::edit_image_dest_rect;
+use kalux_core::{
+    AspectPreset, CropRect, DockLayout, EditRecipe, EditSession, EditTab, Palette, ToneAdjustments,
+    View,
+};
 use kalux_decode::decode_file;
 
+use crate::args::ScreenshotEditMode;
+use crate::linux::edit_ui::draw_edit_ui;
 use crate::linux::overlay::{LinuxOverlay, OverlayView};
 use crate::linux::render::{Canvas, draw_hline, draw_mini_icon};
 
@@ -21,6 +27,7 @@ pub struct ScreenshotOptions {
     pub out: PathBuf,
     pub light: bool,
     pub show_help: bool,
+    pub edit_mode: ScreenshotEditMode,
     pub toast: Option<String>,
     pub title: Option<String>,
     pub width: u32,
@@ -50,9 +57,70 @@ pub fn render_screenshot(opts: &ScreenshotOptions) -> Result<(), String> {
         client_canvas.clear(palette.bg);
 
         let src_sz = (decoded.source_width, decoded.source_height);
-        let view = View::fit(src_sz, (w, client_h));
-        let dest = view.dest_rect(src_sz, (w, client_h));
-        client_canvas.draw_image(&decoded, 0, dest, view.scale);
+        match opts.edit_mode {
+            ScreenshotEditMode::None => {
+                let view = View::fit(src_sz, (w, client_h));
+                let dest = view.dest_rect(src_sz, (w, client_h));
+                client_canvas.draw_image(&decoded, 0, dest, view.scale);
+            }
+            ScreenshotEditMode::Crop | ScreenshotEditMode::Adjust => {
+                let tab = if opts.edit_mode == ScreenshotEditMode::Adjust {
+                    EditTab::Adjust
+                } else {
+                    EditTab::Crop
+                };
+                let mut session = EditSession::new(tab, false, 0, 1);
+                if opts.edit_mode == ScreenshotEditMode::Crop {
+                    session.aspect = AspectPreset::ThreeTwo;
+                    session.history.push(EditRecipe {
+                        crop: CropRect {
+                            x: 0.14,
+                            y: 0.12,
+                            w: 0.72,
+                            h: 0.74,
+                        },
+                        ..EditRecipe::default()
+                    });
+                } else {
+                    session.history.push(EditRecipe {
+                        tone: ToneAdjustments {
+                            exposure: 0.18,
+                            contrast: 0.24,
+                            saturation: 0.16,
+                            warmth: 0.22,
+                            monochrome: false,
+                        },
+                        ..EditRecipe::default()
+                    });
+                }
+                let layout = DockLayout::compute(w, client_h, 1.0, &session);
+                let recipe = session.recipe();
+                let oriented = recipe.oriented_dims(src_sz.0, src_sz.1);
+                let (dest, img_scale) =
+                    edit_image_dest_rect(oriented, (w, client_h), layout.reserved_bottom_px, 1.0);
+                let lut = session.preview_lut();
+                client_canvas.draw_image_edited(
+                    &decoded,
+                    0,
+                    dest,
+                    img_scale,
+                    recipe.turns,
+                    recipe.flip_h,
+                    recipe.flip_v,
+                    &lut,
+                );
+                draw_edit_ui(
+                    &mut client_canvas,
+                    &mut overlay,
+                    1.0,
+                    palette,
+                    dest,
+                    src_sz,
+                    &session,
+                    &layout,
+                );
+            }
+        }
 
         let ov = OverlayView {
             empty_hint: false,
@@ -83,8 +151,12 @@ pub fn render_screenshot(opts: &ScreenshotOptions) -> Result<(), String> {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "image".to_string());
+            let suffix = match opts.edit_mode {
+                ScreenshotEditMode::None => String::new(),
+                ScreenshotEditMode::Crop | ScreenshotEditMode::Adjust => " — Editing".to_string(),
+            };
             format!(
-                "{name} — 1 / 1 — {}×{} — Kalux",
+                "{name} — 1 / 1 — {}×{}{suffix} — Kalux",
                 decoded.source_width, decoded.source_height
             )
         });
