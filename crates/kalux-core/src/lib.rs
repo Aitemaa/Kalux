@@ -8,13 +8,19 @@
 
 pub mod action;
 pub mod cache;
+pub mod edit;
 pub mod image;
 pub mod nav;
 pub mod theme;
 pub mod view;
 
-pub use action::{Action, Modifiers, action_for_key};
+pub use action::{Action, EditAction, Modifiers, action_for_key, edit_action_for_key};
 pub use cache::{ByteLru, Weighted};
+pub use edit::{
+    AspectPreset, CropHandle, CropRect, DockButton, DockLayout, EditHistory, EditPrompt,
+    EditRecipe, EditSession, EditTab, JpegQuality, PixelRect, QuarterTurns, ToneAdjustments,
+    ToneLut, ToneSlider,
+};
 pub use image::{DecodedImage, Frame, ImageFormat, SUPPORTED_EXTENSIONS};
 pub use nav::{Playlist, natural_cmp};
 pub use theme::{Palette, Rgba};
