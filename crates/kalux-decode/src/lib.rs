@@ -17,6 +17,8 @@
 //! optionally downscaled to fit `max_size` (never upscaled; aspect preserved).
 
 mod anim;
+mod exif_orient;
+pub mod export;
 mod jpeg;
 mod orient;
 #[cfg(not(windows))]
@@ -32,6 +34,12 @@ use std::path::Path;
 
 use kalux_core::DecodedImage;
 
+#[cfg(not(windows))]
+pub use export::encode_png_bytes;
+pub use export::{
+    ExportError, ExportFormat, ExportOptions, ExportResult, export_image, next_copy_path,
+    render_edited_image, supports_in_place_overwrite,
+};
 pub use store::{ImageStore, StoreConfig, StoreEvent};
 
 #[derive(Debug, Clone)]

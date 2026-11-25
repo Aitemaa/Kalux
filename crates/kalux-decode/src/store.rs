@@ -434,6 +434,28 @@ impl ImageStore {
         state.pending.retain(|j| j.kind.satisfies(wanted));
     }
 
+    /// Pause neighbor preloading and evict every cached image except `current` so Edit Mode
+    /// adds ~0 MB over Viewer Mode. Returns bytes freed from the LRU cache.
+    pub fn enter_edit_mode(&mut self, current: &Path) -> usize {
+        let current_buf = current.to_path_buf();
+        let (lock, _) = &*self.shared;
+        {
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            state.pending.retain(|j| j.path == current_buf);
+        }
+        self.cache.retain_only(Some(&current_buf))
+    }
+
+    /// Drop all non-active cached entries before full-resolution export so peak RAM stays bounded.
+    pub fn trim_for_export(&mut self) -> usize {
+        let (lock, _) = &*self.shared;
+        {
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            state.pending.clear();
+        }
+        self.cache.retain_only(None)
+    }
+
     /// Current cache weight in bytes (for `--bench` reporting).
     pub fn cache_bytes(&self) -> usize {
         self.cache.total_weight()
