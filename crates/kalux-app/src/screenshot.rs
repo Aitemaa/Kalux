@@ -50,6 +50,7 @@ pub struct ScreenshotOptions {
     pub out: PathBuf,
     pub light: bool,
     pub show_help: bool,
+    pub show_viewer_bar: bool,
     pub edit_mode: ScreenshotEditMode,
     pub toast: Option<String>,
     pub title: Option<String>,
@@ -174,6 +175,10 @@ pub fn render_screenshot(opts: &ScreenshotOptions) -> Result<(), String> {
         loading_label: None,
         toast: opts.toast.as_deref(),
         show_help: opts.show_help,
+        show_viewer_bar: opts.show_viewer_bar
+            && opts.edit_mode == ScreenshotEditMode::None
+            && !opts.show_help,
+        hovered_viewer_button: None,
     };
 
     let bg = rgba_to_d2d(palette.bg);

@@ -35,6 +35,7 @@ pub enum Command {
         out: PathBuf,
         light: bool,
         show_help: bool,
+        show_viewer_bar: bool,
         edit_mode: ScreenshotEditMode,
         toast: Option<String>,
         title: Option<String>,
@@ -183,11 +184,12 @@ fn parse_gen_test_image(mut iter: impl Iterator<Item = OsString>) -> Result<Comm
 }
 
 fn parse_screenshot(mut iter: impl Iterator<Item = OsString>) -> Result<Command, ArgError> {
-    let usage = "Usage: kalux --screenshot <image> <out.png> [--light] [--help] [--edit-crop|--edit-adjust] [--toast <text>] [--title <text>] [--width <w>] [--height <h>]";
+    let usage = "Usage: kalux --screenshot <image> <out.png> [--light] [--help] [--viewer-bar] [--edit-crop|--edit-adjust] [--toast <text>] [--title <text>] [--width <w>] [--height <h>]";
     let image = iter.next().ok_or_else(|| ArgError::cli(usage))?;
     let out = iter.next().ok_or_else(|| ArgError::cli(usage))?;
     let mut light = false;
     let mut show_help = false;
+    let mut show_viewer_bar = false;
     let mut edit_mode = ScreenshotEditMode::None;
     let mut toast: Option<String> = None;
     let mut title: Option<String> = None;
@@ -201,6 +203,7 @@ fn parse_screenshot(mut iter: impl Iterator<Item = OsString>) -> Result<Command,
         match flag {
             "--light" => light = true,
             "--help" => show_help = true,
+            "--viewer-bar" => show_viewer_bar = true,
             "--edit-crop" => edit_mode = ScreenshotEditMode::Crop,
             "--edit-adjust" => edit_mode = ScreenshotEditMode::Adjust,
             "--toast" => {
@@ -240,6 +243,7 @@ fn parse_screenshot(mut iter: impl Iterator<Item = OsString>) -> Result<Command,
         out: PathBuf::from(out),
         light,
         show_help,
+        show_viewer_bar,
         edit_mode,
         toast,
         title,
@@ -373,6 +377,7 @@ mod tests {
                 "out.png",
                 "--light",
                 "--help",
+                "--viewer-bar",
                 "--edit-crop",
                 "--toast",
                 "100%",
@@ -388,6 +393,7 @@ mod tests {
                 out: PathBuf::from("out.png"),
                 light: true,
                 show_help: true,
+                show_viewer_bar: true,
                 edit_mode: ScreenshotEditMode::Crop,
                 toast: Some("100%".to_string()),
                 title: Some("demo.jpg — Kalux".to_string()),
