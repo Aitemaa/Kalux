@@ -207,7 +207,7 @@ checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
 
 [[package]]
 name = "kalux-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "embed-manifest",
@@ -225,11 +225,11 @@ dependencies = [
 
 [[package]]
 name = "kalux-core"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "kalux-decode"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-channel",
  "gif",
