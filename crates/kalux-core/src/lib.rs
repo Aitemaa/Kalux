@@ -24,4 +24,4 @@ pub use edit::{
 pub use image::{DecodedImage, Frame, ImageFormat, SUPPORTED_EXTENSIONS};
 pub use nav::{Playlist, natural_cmp};
 pub use theme::{Palette, Rgba};
-pub use view::{Rect, View, ZoomMode};
+pub use view::{Rect, View, ViewerBarLayout, ViewerButton, ZoomMode};

@@ -8,6 +8,12 @@ pub struct Rect {
     pub h: f32,
 }
 
+impl Rect {
+    pub fn contains(self, pt: (f32, f32)) -> bool {
+        pt.0 >= self.x && pt.0 <= self.x + self.w && pt.1 >= self.y && pt.1 <= self.y + self.h
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ZoomMode {
     /// Fit inside the client area, never upscale beyond 100% (small images stay 1:1, centered).
@@ -174,6 +180,84 @@ impl View {
     }
 }
 
+/// Interactive controls inside the auto-hiding top-right Viewer Mode pill.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ViewerButton {
+    Edit,
+    Help,
+}
+
+/// Physical-pixel geometry for the top-right Viewer Mode floating pill (`Edit (E)` + `?`).
+///
+/// Shared across Windows (Direct2D) and Linux (Wayland `wl_shm`) so hit-testing and visuals
+/// match pixel-for-pixel.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ViewerBarLayout {
+    pub panel: Rect,
+    pub edit: Rect,
+    pub help: Rect,
+}
+
+impl ViewerBarLayout {
+    /// Compute top-right viewer pill geometry for client size `(client_w, client_h)` at `scale >= 1.0`.
+    pub fn compute(client_w: u32, client_h: u32, scale: f32) -> Self {
+        let s = scale.max(1.0);
+        let cw = client_w as f32;
+        let ch = client_h as f32;
+
+        let margin = 14.0 * s;
+        let pad = 4.0 * s;
+        let btn_h = 28.0 * s;
+        let edit_w = 78.0 * s;
+        let gap = 4.0 * s;
+        let help_w = 28.0 * s;
+
+        let panel_w = pad + edit_w + gap + help_w + pad;
+        let panel_h = pad + btn_h + pad;
+
+        let panel_x = (cw - panel_w - margin).max(8.0 * s);
+        let panel_y = margin.min((ch - panel_h - 8.0 * s).max(4.0 * s));
+
+        let edit = Rect {
+            x: panel_x + pad,
+            y: panel_y + pad,
+            w: edit_w,
+            h: btn_h,
+        };
+        let help = Rect {
+            x: edit.x + edit.w + gap,
+            y: panel_y + pad,
+            w: help_w,
+            h: btn_h,
+        };
+
+        Self {
+            panel: Rect {
+                x: panel_x,
+                y: panel_y,
+                w: panel_w,
+                h: panel_h,
+            },
+            edit,
+            help,
+        }
+    }
+
+    pub fn hit_test(&self, pt: (f32, f32)) -> Option<ViewerButton> {
+        if self.edit.contains(pt) {
+            Some(ViewerButton::Edit)
+        } else if self.help.contains(pt) {
+            Some(ViewerButton::Help)
+        } else {
+            None
+        }
+    }
+
+    pub fn contains_point(&self, pt: (f32, f32)) -> bool {
+        self.panel.contains(pt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +375,34 @@ mod tests {
         // Already full resolution: even at 4x zoom -> false
         v.zoom_at(10.0, (960.0, 540.0), source, (1920, 1080));
         assert!(!v.needs_full_resolution(source, source));
+    }
+
+    #[test]
+    fn viewer_bar_layout_positions_top_right_and_hit_tests() {
+        let layout = ViewerBarLayout::compute(1280, 720, 1.0);
+        // Anchored 14px from top-right corner.
+        approx_eq(layout.panel.x + layout.panel.w, 1280.0 - 14.0);
+        approx_eq(layout.panel.y, 14.0);
+
+        let edit_center = (
+            layout.edit.x + layout.edit.w * 0.5,
+            layout.edit.y + layout.edit.h * 0.5,
+        );
+        let help_center = (
+            layout.help.x + layout.help.w * 0.5,
+            layout.help.y + layout.help.h * 0.5,
+        );
+        assert_eq!(layout.hit_test(edit_center), Some(ViewerButton::Edit));
+        assert_eq!(layout.hit_test(help_center), Some(ViewerButton::Help));
+        assert!(layout.contains_point(edit_center));
+        assert!(layout.contains_point(help_center));
+        assert_eq!(layout.hit_test((10.0, 10.0)), None);
+        assert!(!layout.contains_point((10.0, 10.0)));
+
+        // HiDPI scales proportionally.
+        let hidpi = ViewerBarLayout::compute(2560, 1440, 2.0);
+        approx_eq(hidpi.panel.w, layout.panel.w * 2.0);
+        approx_eq(hidpi.panel.h, layout.panel.h * 2.0);
+        approx_eq(hidpi.panel.x + hidpi.panel.w, 2560.0 - 28.0);
     }
 }

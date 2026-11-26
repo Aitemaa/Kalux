@@ -13,7 +13,8 @@ use kalux_core::action::VK_COMPARE;
 use kalux_core::edit::{EditDrag, edit_image_dest_rect, hit_test_crop};
 use kalux_core::{
     Action, CropHandle, CropRect, DecodedImage, DockButton, DockLayout, EditAction, EditPrompt,
-    EditSession, EditTab, ImageFormat, Palette, Playlist, Rect, ToneSlider, View,
+    EditSession, EditTab, ImageFormat, Palette, Playlist, Rect, ToneSlider, View, ViewerBarLayout,
+    ViewerButton,
 };
 use kalux_decode::{
     DecodeError, ExportError, ExportOptions, ExportResult, ImageStore, StoreConfig, StoreEvent,
@@ -38,7 +39,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::Shell::DragAcceptFiles;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -68,6 +71,7 @@ const WM_APP_DECODED: u32 = WM_APP + 1;
 const WM_APP_PLAYLIST: u32 = WM_APP + 2;
 const WM_APP_EXPORT_DONE: u32 = WM_APP + 3;
 const WM_APP_CLIPBOARD_DONE: u32 = WM_APP + 4;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 const CF_DIB: u32 = 8;
 
@@ -75,8 +79,10 @@ const TIMER_ANIM: usize = 1;
 const TIMER_TOAST: usize = 2;
 const TIMER_BENCH_SAMPLE: usize = 3;
 const TIMER_BENCH_TIMEOUT: usize = 4;
+const TIMER_VIEWER_BAR: usize = 5;
 
 const TOAST_DURATION_MS: u32 = 1600;
+const VIEWER_BAR_HIDE_MS: u32 = 2000;
 const DOUBLE_CLICK_MAX_GAP: Duration = Duration::from_millis(400);
 const BENCH_SAMPLE_DELAY_MS: u32 = 1000;
 const BENCH_TIMEOUT_MS: u32 = 30_000;
@@ -130,6 +136,9 @@ struct AppState {
     loading_label: Option<String>,
     toast: Option<String>,
     show_help: bool,
+    viewer_bar_visible: bool,
+    hovered_viewer_button: Option<ViewerButton>,
+    tracking_mouse_leave: bool,
 
     // Edit Mode
     edit: Option<EditSession>,
@@ -250,6 +259,9 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         loading_label: None,
         toast: None,
         show_help: false,
+        viewer_bar_visible: false,
+        hovered_viewer_button: None,
+        tracking_mouse_leave: false,
         edit: None,
         compare_via_dock: false,
         last_slider_click: None,
@@ -503,6 +515,7 @@ impl AppState {
 
     fn show_decode_error(&mut self, hwnd: HWND, path: &Path, error: &DecodeError) {
         self.kill_anim_timer(hwnd);
+        self.hide_viewer_bar(hwnd);
         self.loading_label = None;
         self.current_image = None;
         if let Some(renderer) = self.renderer.as_mut() {
@@ -552,6 +565,7 @@ impl AppState {
         if self.edit.is_some() {
             self.exit_edit_mode(hwnd);
         }
+        self.hide_viewer_bar(hwnd);
         self.playlist = Some(Playlist::single(path.clone()));
         self.scan_generation = self.scan_generation.wrapping_add(1);
         self.focus_path(hwnd, path.clone(), &[]);
@@ -612,6 +626,8 @@ impl AppState {
         else {
             return;
         };
+        let is_anim = img.is_animated();
+        let total_frames = img.frames.len().max(1);
         if let Some(ref mut s) = self.edit {
             s.tab = tab;
             invalidate(hwnd);
@@ -620,12 +636,11 @@ impl AppState {
         // Evict neighbor cache entries immediately so Edit Mode stays strictly within the RAM budget.
         self.store.enter_edit_mode(&path);
         self.show_help = false;
+        self.hide_viewer_bar(hwnd);
         self.dragging = false;
         self.compare_via_dock = false;
         self.kill_anim_timer(hwnd);
 
-        let is_anim = img.is_animated();
-        let total_frames = img.frames.len().max(1);
         let frame_idx = self.frame_index.min(total_frames - 1);
         self.edit = Some(EditSession::new(tab, is_anim, frame_idx, total_frames));
         self.update_title(hwnd);
@@ -1373,21 +1388,24 @@ impl AppState {
     }
 
     fn apply_edit_cursor(&self) -> bool {
-        let Some(ref s) = self.edit else {
-            return false;
-        };
-        let cursor_id = if let Some(drag) = s.drag {
-            match drag {
-                EditDrag::Slider { .. } => IDC_HAND,
-                EditDrag::NewCrop { .. } => IDC_CROSS,
-                EditDrag::CropHandle { handle, .. } => cursor_for_handle(handle),
+        let cursor_id = if let Some(ref s) = self.edit {
+            if let Some(drag) = s.drag {
+                match drag {
+                    EditDrag::Slider { .. } => IDC_HAND,
+                    EditDrag::NewCrop { .. } => IDC_CROSS,
+                    EditDrag::CropHandle { handle, .. } => cursor_for_handle(handle),
+                }
+            } else if s.hovered_button.is_some() {
+                IDC_HAND
+            } else if let Some(handle) = s.hovered_handle {
+                cursor_for_handle(handle)
+            } else {
+                IDC_ARROW
             }
-        } else if s.hovered_button.is_some() {
+        } else if self.viewer_bar_visible && self.hovered_viewer_button.is_some() {
             IDC_HAND
-        } else if let Some(handle) = s.hovered_handle {
-            cursor_for_handle(handle)
         } else {
-            IDC_ARROW
+            return false;
         };
         // SAFETY: Loading standard system cursor and applying it inside `WM_SETCURSOR`.
         if let Ok(hcur) = unsafe { LoadCursorW(None, cursor_id) } {
@@ -1397,6 +1415,108 @@ impl AppState {
             return true;
         }
         false
+    }
+
+    fn can_show_viewer_bar(&self) -> bool {
+        self.edit.is_none()
+            && self.current_image.is_some()
+            && self.error.is_none()
+            && self.loading_label.is_none()
+            && !self.show_help
+            && self.bench.is_none()
+    }
+
+    fn viewer_bar_layout(&self) -> ViewerBarLayout {
+        ViewerBarLayout::compute(self.client_size.0, self.client_size.1, self.dpi_scale())
+    }
+
+    fn hide_viewer_bar(&mut self, hwnd: HWND) {
+        // SAFETY: `hwnd` is valid; killing a non-running timer is a no-op.
+        let _ = unsafe { KillTimer(Some(hwnd), TIMER_VIEWER_BAR) };
+        let changed = self.viewer_bar_visible || self.hovered_viewer_button.is_some();
+        self.viewer_bar_visible = false;
+        self.hovered_viewer_button = None;
+        if changed {
+            invalidate(hwnd);
+        }
+    }
+
+    fn handle_viewer_mouse_move(&mut self, hwnd: HWND, lp: LPARAM) {
+        if !self.can_show_viewer_bar() {
+            self.hide_viewer_bar(hwnd);
+            return;
+        }
+        if !self.tracking_mouse_leave {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // SAFETY: `tme` is properly initialized with valid `hwnd` and struct size.
+            if unsafe { TrackMouseEvent(&mut tme) }.is_ok() {
+                self.tracking_mouse_leave = true;
+            }
+        }
+
+        let phys = (
+            input::get_x_lparam(lp) as f32,
+            input::get_y_lparam(lp) as f32,
+        );
+        let layout = self.viewer_bar_layout();
+        let hovered = layout.hit_test(phys);
+        let in_bar = layout.contains_point(phys);
+
+        let mut changed = false;
+        if !self.viewer_bar_visible {
+            self.viewer_bar_visible = true;
+            changed = true;
+        }
+        if self.hovered_viewer_button != hovered {
+            self.hovered_viewer_button = hovered;
+            changed = true;
+        }
+
+        if in_bar {
+            // Keep pill visible while hovering over it.
+            // SAFETY: `hwnd` is valid.
+            let _ = unsafe { KillTimer(Some(hwnd), TIMER_VIEWER_BAR) };
+        } else {
+            // Auto-hide after 2 s of mouse inactivity outside the pill.
+            // SAFETY: `hwnd` is valid; resets one-shot auto-hide timer.
+            unsafe {
+                SetTimer(Some(hwnd), TIMER_VIEWER_BAR, VIEWER_BAR_HIDE_MS, None);
+            }
+        }
+
+        if changed {
+            invalidate(hwnd);
+        }
+    }
+
+    fn handle_viewer_mouse_leave(&mut self, hwnd: HWND) {
+        self.tracking_mouse_leave = false;
+        self.hide_viewer_bar(hwnd);
+    }
+
+    fn handle_viewer_bar_click(&mut self, hwnd: HWND, lp: LPARAM) -> bool {
+        if !self.viewer_bar_visible || !self.can_show_viewer_bar() {
+            return false;
+        }
+        let phys = (
+            input::get_x_lparam(lp) as f32,
+            input::get_y_lparam(lp) as f32,
+        );
+        let layout = self.viewer_bar_layout();
+        if let Some(btn) = layout.hit_test(phys) {
+            self.hide_viewer_bar(hwnd);
+            match btn {
+                ViewerButton::Edit => self.enter_edit_mode(hwnd, EditTab::Crop),
+                ViewerButton::Help => self.handle_action(hwnd, Action::ShowHelp),
+            }
+            return true;
+        }
+        layout.contains_point(phys)
     }
 
     fn handle_action(&mut self, hwnd: HWND, action: Action) {
@@ -1441,6 +1561,9 @@ impl AppState {
             }
             Action::ShowHelp => {
                 self.show_help = !self.show_help;
+                if self.show_help {
+                    self.hide_viewer_bar(hwnd);
+                }
                 invalidate(hwnd);
             }
             Action::EditMode | Action::CropMode => {
@@ -1506,9 +1629,13 @@ impl AppState {
             self.handle_edit_mouse_down(hwnd, lp);
             return;
         }
+        if self.handle_viewer_bar_click(hwnd, lp) {
+            return;
+        }
         if self.current_image.is_none() {
             return;
         }
+        self.hide_viewer_bar(hwnd);
         self.dragging = true;
         self.last_drag_pos = (input::get_x_lparam(lp), input::get_y_lparam(lp));
         // SAFETY: `hwnd` is valid; paired with `ReleaseCapture` on button up / capture changed.
@@ -1521,6 +1648,7 @@ impl AppState {
             return;
         }
         if !self.dragging {
+            self.handle_viewer_mouse_move(hwnd, lp);
             return;
         }
         let Some(source) = self.current_source_size() else {
@@ -1692,6 +1820,7 @@ impl AppState {
                 // SAFETY: `hwnd` is valid.
                 let _ = unsafe { DestroyWindow(hwnd) };
             }
+            TIMER_VIEWER_BAR => self.hide_viewer_bar(hwnd),
             _ => {}
         }
     }
@@ -1795,6 +1924,8 @@ impl AppState {
             loading_label: self.loading_label.as_deref(),
             toast: self.toast.as_deref(),
             show_help: self.show_help && self.edit.is_none(),
+            show_viewer_bar: self.viewer_bar_visible && self.can_show_viewer_bar(),
+            hovered_viewer_button: self.hovered_viewer_button,
         };
 
         let edit_geo = self.edit.as_ref().and_then(|s| self.edit_geometry(s));
@@ -2040,6 +2171,11 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
 
+        WM_MOUSELEAVE => {
+            state.handle_viewer_mouse_leave(hwnd);
+            LRESULT(0)
+        }
+
         WM_LBUTTONUP => {
             state.handle_lbutton_up(hwnd);
             LRESULT(0)
@@ -2057,7 +2193,7 @@ unsafe extern "system" fn wnd_proc(
             if state.edit.is_some() {
                 // Forward double-clicks inside Edit Mode so double-clicking sliders resets them.
                 state.handle_lbutton_down(hwnd, lparam);
-            } else {
+            } else if !state.handle_viewer_bar_click(hwnd, lparam) {
                 state.toggle_fullscreen(hwnd);
             }
             LRESULT(0)
@@ -2110,6 +2246,7 @@ unsafe extern "system" fn wnd_proc(
                 let _ = KillTimer(Some(hwnd), TIMER_TOAST);
                 let _ = KillTimer(Some(hwnd), TIMER_BENCH_SAMPLE);
                 let _ = KillTimer(Some(hwnd), TIMER_BENCH_TIMEOUT);
+                let _ = KillTimer(Some(hwnd), TIMER_VIEWER_BAR);
                 PostQuitMessage(state.exit_code);
             }
             LRESULT(0)

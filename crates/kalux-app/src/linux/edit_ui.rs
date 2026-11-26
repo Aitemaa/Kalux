@@ -725,7 +725,7 @@ fn draw_icon_chip(
     }
 }
 
-fn draw_aa_segment(
+pub(crate) fn draw_aa_segment(
     canvas: &mut Canvas<'_>,
     x0: f32,
     y0: f32,

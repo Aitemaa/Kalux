@@ -23,7 +23,8 @@ use kalux_core::edit::{EditDrag, edit_image_dest_rect, hit_test_crop};
 use kalux_core::view::ZoomMode;
 use kalux_core::{
     Action, CropHandle, CropRect, DecodedImage, DockButton, DockLayout, EditPrompt, EditSession,
-    EditTab, ImageFormat, Palette, Playlist, QuarterTurns, Rect, View,
+    EditTab, ImageFormat, Palette, Playlist, QuarterTurns, Rect, View, ViewerBarLayout,
+    ViewerButton,
 };
 use kalux_decode::{
     DecodeError, ExportError, ExportOptions, ExportResult, ImageStore, StoreConfig, StoreEvent,
@@ -65,6 +66,7 @@ const DEFAULT_LOGICAL_W: u32 = 1180;
 const DEFAULT_LOGICAL_H: u32 = 760;
 const DEFAULT_DECODE_TARGET: (u32, u32) = (2560, 1440);
 const TOAST_DURATION: Duration = Duration::from_millis(1400);
+const VIEWER_BAR_HIDE_DELAY: Duration = Duration::from_millis(2000);
 const DOUBLE_CLICK_MAX_GAP: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_MAX_DIST_SQ: f64 = 36.0;
 const BENCH_SAMPLE_DELAY: Duration = Duration::from_millis(500);
@@ -183,6 +185,9 @@ struct WaylandApp {
     toast: Option<String>,
     toast_expires_at: Option<Instant>,
     show_help: bool,
+    viewer_bar_visible: bool,
+    viewer_bar_hide_at: Option<Instant>,
+    hovered_viewer_button: Option<ViewerButton>,
 
     // Image & viewing state
     store: ImageStore,
@@ -346,6 +351,8 @@ impl WaylandApp {
             }
         } else if self.dragging {
             2
+        } else if self.viewer_bar_visible && self.hovered_viewer_button.is_some() {
+            3
         } else if self.is_pannable() {
             1
         } else {
@@ -370,6 +377,87 @@ impl WaylandApp {
             };
             dev.set_shape(conn, self.pointer_enter_serial, shape);
         }
+    }
+
+    fn can_show_viewer_bar(&self) -> bool {
+        self.edit.is_none()
+            && self.current_image.is_some()
+            && self.error.is_none()
+            && self.loading_label.is_none()
+            && !self.show_help
+            && self.bench.is_none()
+    }
+
+    fn viewer_bar_layout(&self) -> ViewerBarLayout {
+        let (pw, ph) = self.physical_size();
+        ViewerBarLayout::compute(pw, ph, self.scale_f32())
+    }
+
+    fn hide_viewer_bar(&mut self, conn: &mut Connection<Self>) {
+        let changed = self.viewer_bar_visible || self.hovered_viewer_button.is_some();
+        self.viewer_bar_visible = false;
+        self.viewer_bar_hide_at = None;
+        self.hovered_viewer_button = None;
+        if changed {
+            self.needs_redraw = true;
+            self.update_cursor(conn);
+        }
+    }
+
+    fn handle_viewer_pointer_motion(&mut self, conn: &mut Connection<Self>) {
+        if !self.can_show_viewer_bar() {
+            self.hide_viewer_bar(conn);
+            return;
+        }
+        let phys = self.pointer_pos_physical();
+        let layout = self.viewer_bar_layout();
+        let hovered = layout.hit_test(phys);
+        let in_bar = layout.contains_point(phys);
+
+        let mut changed = false;
+        if !self.viewer_bar_visible {
+            self.viewer_bar_visible = true;
+            changed = true;
+        }
+        if self.hovered_viewer_button != hovered {
+            self.hovered_viewer_button = hovered;
+            changed = true;
+        }
+
+        // Keep pill visible while hovering over it; otherwise auto-hide after 2 s.
+        self.viewer_bar_hide_at = if in_bar {
+            None
+        } else {
+            Some(Instant::now() + VIEWER_BAR_HIDE_DELAY)
+        };
+
+        if changed {
+            self.needs_redraw = true;
+            self.update_cursor(conn);
+        }
+    }
+
+    fn handle_viewer_bar_click(&mut self, conn: &mut Connection<Self>) -> bool {
+        if !self.viewer_bar_visible || !self.can_show_viewer_bar() {
+            return false;
+        }
+        let phys = self.pointer_pos_physical();
+        let layout = self.viewer_bar_layout();
+        if let Some(btn) = layout.hit_test(phys) {
+            self.last_left_click = None;
+            self.dragging = false;
+            self.hide_viewer_bar(conn);
+            match btn {
+                ViewerButton::Edit => self.enter_edit_mode(conn, EditTab::Crop),
+                ViewerButton::Help => self.handle_action(conn, Action::ShowHelp),
+            }
+            return true;
+        }
+        if layout.contains_point(phys) {
+            self.last_left_click = None;
+            return true;
+        }
+        false
     }
 
     fn is_pannable(&self) -> bool {
@@ -403,6 +491,9 @@ impl WaylandApp {
     fn open_file(&mut self, conn: &mut Connection<Self>, path: PathBuf, rescan: bool) {
         self.edit = None;
         self.compare_via_dock = false;
+        self.viewer_bar_visible = false;
+        self.viewer_bar_hide_at = None;
+        self.hovered_viewer_button = None;
         self.focused_path = Some(path.clone());
         self.error = None;
         self.full_res_requested = false;
@@ -517,6 +608,9 @@ impl WaylandApp {
         // Evict neighbor cache entries immediately so Edit Mode stays strictly within the RAM budget.
         self.store.enter_edit_mode(&path);
         self.show_help = false;
+        self.viewer_bar_visible = false;
+        self.viewer_bar_hide_at = None;
+        self.hovered_viewer_button = None;
         self.dragging = false;
         self.next_anim_at = None;
         self.active_repeat = None;
@@ -1382,6 +1476,9 @@ impl WaylandApp {
             }
             Action::ShowHelp => {
                 self.show_help = !self.show_help;
+                if self.show_help {
+                    self.hide_viewer_bar(conn);
+                }
                 self.needs_redraw = true;
             }
             Action::Escape => {
@@ -1447,6 +1544,12 @@ impl WaylandApp {
             self.toast = None;
             self.toast_expires_at = None;
             self.needs_redraw = true;
+        }
+
+        if let Some(hide_at) = self.viewer_bar_hide_at
+            && now >= hide_at
+        {
+            self.hide_viewer_bar(conn);
         }
 
         if let Some(anim_at) = self.next_anim_at
@@ -1525,6 +1628,7 @@ impl WaylandApp {
     fn next_deadline(&self) -> Option<Instant> {
         [
             self.toast_expires_at,
+            self.viewer_bar_hide_at,
             self.next_anim_at,
             self.active_repeat.as_ref().map(|r| r.next_at),
             self.bench_sample_at,
@@ -1546,6 +1650,7 @@ impl WaylandApp {
 
         let shm = self.shm;
         let scale = self.scale_f32();
+        let show_viewer_bar = self.viewer_bar_visible && self.can_show_viewer_bar();
         let Ok((_slot_idx, buffer, pixels)) =
             self.swapchain.acquire(conn, shm, pw, ph, |state, idx| {
                 state.swapchain.mark_released(idx);
@@ -1606,6 +1711,8 @@ impl WaylandApp {
             loading_label: self.loading_label.as_deref(),
             toast: self.toast.as_deref(),
             show_help: self.show_help && self.edit.is_none(),
+            show_viewer_bar,
+            hovered_viewer_button: self.hovered_viewer_button,
         };
         self.overlay.draw(&mut canvas, scale, self.palette, &ov);
 
@@ -1810,6 +1917,9 @@ pub fn run(cfg: LaunchConfig) -> i32 {
         toast: None,
         toast_expires_at: None,
         show_help: false,
+        viewer_bar_visible: false,
+        viewer_bar_hide_at: None,
+        hovered_viewer_button: None,
 
         store,
         preload_radius,
@@ -2145,6 +2255,7 @@ fn wl_pointer_cb(ctx: EventCtx<WaylandApp, WlPointer>) {
         }
         wl_pointer::Event::Leave(_) => {
             ctx.state.dragging = false;
+            ctx.state.hide_viewer_bar(ctx.conn);
             if let Some(ref mut s) = ctx.state.edit
                 && s.drag.is_none()
                 && (s.hovered_button.is_some() || s.hovered_handle.is_some())
@@ -2172,6 +2283,8 @@ fn wl_pointer_cb(ctx: EventCtx<WaylandApp, WlPointer>) {
                     ctx.state.view.pan_by(dx, dy, src, client);
                     ctx.state.needs_redraw = true;
                 }
+            } else {
+                ctx.state.handle_viewer_pointer_motion(ctx.conn);
             }
         }
         wl_pointer::Event::Button(args) => {
@@ -2188,6 +2301,9 @@ fn wl_pointer_cb(ctx: EventCtx<WaylandApp, WlPointer>) {
             match args.button {
                 BTN_LEFT => {
                     if pressed {
+                        if ctx.state.handle_viewer_bar_click(ctx.conn) {
+                            return;
+                        }
                         let now = Instant::now();
                         let pos = ctx.state.pointer_pos_logical;
                         let is_double =
@@ -2204,6 +2320,7 @@ fn wl_pointer_cb(ctx: EventCtx<WaylandApp, WlPointer>) {
                         } else {
                             ctx.state.last_left_click = Some((now, pos));
                             if ctx.state.is_pannable() {
+                                ctx.state.hide_viewer_bar(ctx.conn);
                                 ctx.state.dragging = true;
                                 ctx.state.last_drag_phys = ctx.state.pointer_pos_physical();
                             }

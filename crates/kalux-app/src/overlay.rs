@@ -7,7 +7,7 @@
 //! when opening an image file normally.
 
 use kalux_core::action::help_rows;
-use kalux_core::{Palette, Rgba};
+use kalux_core::{Palette, Rgba, ViewerBarLayout, ViewerButton};
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1RenderTarget,
@@ -39,6 +39,8 @@ pub struct OverlayView<'a> {
     pub loading_label: Option<&'a str>,
     pub toast: Option<&'a str>,
     pub show_help: bool,
+    pub show_viewer_bar: bool,
+    pub hovered_viewer_button: Option<ViewerButton>,
 }
 
 impl OverlayView<'_> {
@@ -48,6 +50,7 @@ impl OverlayView<'_> {
             || self.loading_label.is_some()
             || self.toast.is_some()
             || self.show_help
+            || self.show_viewer_bar
     }
 }
 
@@ -58,19 +61,27 @@ struct TextFormats {
     body_center: IDWriteTextFormat,
     small_center: IDWriteTextFormat,
     key: IDWriteTextFormat,
+    viewer_label: IDWriteTextFormat,
+    viewer_key: IDWriteTextFormat,
+    viewer_help: IDWriteTextFormat,
 }
 
 struct TargetBrushes {
     is_dark: bool,
     panel_bg: ID2D1SolidColorBrush,
+    panel_solid: ID2D1SolidColorBrush,
+    viewer_panel_bg: ID2D1SolidColorBrush,
     panel_border: ID2D1SolidColorBrush,
     key_bg: ID2D1SolidColorBrush,
+    surface_2: ID2D1SolidColorBrush,
     key_border: ID2D1SolidColorBrush,
     scrim: ID2D1SolidColorBrush,
     text_primary: ID2D1SolidColorBrush,
     text_muted: ID2D1SolidColorBrush,
     accent_red: ID2D1SolidColorBrush,
     accent_red_text: ID2D1SolidColorBrush,
+    white: ID2D1SolidColorBrush,
+    white_badge_bg: ID2D1SolidColorBrush,
 }
 
 /// Manages lazily initialized DirectWrite resources and target-bound brushes.
@@ -122,6 +133,10 @@ impl OverlayRenderer {
 
         if let Some(toast) = view.toast {
             self.draw_toast(target, w, h, scale, toast);
+        }
+
+        if view.show_viewer_bar && !view.show_help && view.error.is_none() {
+            self.draw_viewer_bar(target, client, scale, view.hovered_viewer_button);
         }
 
         if view.show_help {
@@ -188,6 +203,33 @@ impl OverlayRenderer {
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
                 DWRITE_WORD_WRAPPING_NO_WRAP,
             )?;
+            let viewer_label = create_format(
+                factory,
+                w!("Segoe UI"),
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                12.0 * scale,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                DWRITE_WORD_WRAPPING_NO_WRAP,
+            )?;
+            let viewer_key = create_format(
+                factory,
+                w!("Consolas"),
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                10.5 * scale,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                DWRITE_WORD_WRAPPING_NO_WRAP,
+            )?;
+            let viewer_help = create_format(
+                factory,
+                w!("Segoe UI"),
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                13.0 * scale,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                DWRITE_WORD_WRAPPING_NO_WRAP,
+            )?;
 
             self.formats = Some(TextFormats {
                 dpi,
@@ -196,6 +238,9 @@ impl OverlayRenderer {
                 body_center,
                 small_center,
                 key,
+                viewer_label,
+                viewer_key,
+                viewer_help,
             });
         }
 
@@ -222,18 +267,24 @@ impl OverlayRenderer {
         };
 
         let panel_alpha = if p.is_dark { 244 } else { 248 };
+        let viewer_panel_alpha = if p.is_dark { 236 } else { 244 };
 
         self.brushes = Some(TargetBrushes {
             is_dark: p.is_dark,
             panel_bg: make(p.panel.with_alpha(panel_alpha))?,
+            panel_solid: make(p.panel)?,
+            viewer_panel_bg: make(p.panel.with_alpha(viewer_panel_alpha))?,
             panel_border: make(p.line)?,
             key_bg: make(p.surface)?,
+            surface_2: make(p.surface_2)?,
             key_border: make(p.line_strong)?,
             scrim: make(p.scrim)?,
             text_primary: make(p.text)?,
             text_muted: make(p.muted)?,
             accent_red: make(p.red)?,
             accent_red_text: make(p.red_text)?,
+            white: make(Rgba::rgb(0xFF, 0xFF, 0xFF))?,
+            white_badge_bg: make(Rgba::rgb(0xFF, 0xFF, 0xFF).with_alpha(48))?,
         });
 
         Ok(())
@@ -663,6 +714,173 @@ impl OverlayRenderer {
             },
             &brushes.text_muted,
         );
+    }
+
+    fn draw_viewer_bar(
+        &self,
+        target: &ID2D1RenderTarget,
+        client: (u32, u32),
+        s: f32,
+        hovered: Option<ViewerButton>,
+    ) {
+        let Some(formats) = self.formats.as_ref() else {
+            return;
+        };
+        let Some(brushes) = self.brushes.as_ref() else {
+            return;
+        };
+
+        let layout = ViewerBarLayout::compute(client.0, client.1, s);
+        let p = layout.panel;
+        let panel_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: p.x,
+                top: p.y,
+                right: p.x + p.w,
+                bottom: p.y + p.h,
+            },
+            radiusX: 10.0 * s,
+            radiusY: 10.0 * s,
+        };
+        // SAFETY: Valid D2D render target and brushes.
+        unsafe {
+            target.FillRoundedRectangle(&panel_rr, &brushes.viewer_panel_bg);
+            target.DrawRoundedRectangle(&panel_rr, &brushes.key_border, 1.0 * s, None);
+        }
+
+        // --- Edit (E) button ---
+        let er = layout.edit;
+        let edit_hovered = hovered == Some(ViewerButton::Edit);
+        let edit_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: er.x,
+                top: er.y,
+                right: er.x + er.w,
+                bottom: er.y + er.h,
+            },
+            radiusX: 6.0 * s,
+            radiusY: 6.0 * s,
+        };
+        let (edit_bg, edit_border, edit_fg, badge_bg, badge_border, badge_fg) = if edit_hovered {
+            (
+                &brushes.accent_red,
+                None,
+                &brushes.white,
+                &brushes.white_badge_bg,
+                None,
+                &brushes.white,
+            )
+        } else {
+            (
+                &brushes.key_bg,
+                Some(&brushes.panel_border),
+                &brushes.text_primary,
+                &brushes.panel_solid,
+                Some(&brushes.key_border),
+                &brushes.text_muted,
+            )
+        };
+        // SAFETY: Valid D2D render target and brushes.
+        unsafe {
+            target.FillRoundedRectangle(&edit_rr, edit_bg);
+            if let Some(border) = edit_border {
+                target.DrawRoundedRectangle(&edit_rr, border, 1.0 * s, None);
+            }
+        }
+
+        // Crisp 45-degree vector pencil icon on the left side of the Edit button.
+        let icx = er.x + 13.5 * s;
+        let icy = er.y + er.h * 0.5;
+        let sw = 1.35 * s;
+        let seg = |x0: f32, y0: f32, x1: f32, y1: f32| {
+            // SAFETY: Valid D2D render target and solid color brush.
+            unsafe {
+                target.DrawLine(
+                    Vector2 {
+                        X: icx + x0 * s,
+                        Y: icy + y0 * s,
+                    },
+                    Vector2 {
+                        X: icx + x1 * s,
+                        Y: icy + y1 * s,
+                    },
+                    edit_fg,
+                    sw,
+                    None,
+                );
+            }
+        };
+        seg(-4.5, 4.5, -4.5, 1.9);
+        seg(-4.5, 4.5, -1.9, 4.5);
+        seg(-4.5, 1.9, 1.9, -4.5);
+        seg(-1.9, 4.5, 4.5, -1.9);
+        seg(1.9, -4.5, 4.5, -1.9);
+        seg(0.5, -3.1, 3.1, -0.5);
+
+        // Shortcut keycap badge ("E") on the right side of the Edit button.
+        let badge_sz = 18.0 * s;
+        let badge_x = er.x + er.w - badge_sz - 6.0 * s;
+        let badge_y = er.y + (er.h - badge_sz) * 0.5;
+        let badge_rect = D2D_RECT_F {
+            left: badge_x,
+            top: badge_y,
+            right: badge_x + badge_sz,
+            bottom: badge_y + badge_sz,
+        };
+        let badge_rr = D2D1_ROUNDED_RECT {
+            rect: badge_rect,
+            radiusX: 4.0 * s,
+            radiusY: 4.0 * s,
+        };
+        // SAFETY: Valid D2D render target and brushes.
+        unsafe {
+            target.FillRoundedRectangle(&badge_rr, badge_bg);
+            if let Some(border) = badge_border {
+                target.DrawRoundedRectangle(&badge_rr, border, 1.0 * s, None);
+            }
+        }
+
+        draw_text(
+            target,
+            "Edit",
+            &formats.viewer_label,
+            D2D_RECT_F {
+                left: er.x + 23.5 * s,
+                top: er.y,
+                right: badge_x - 2.0 * s,
+                bottom: er.y + er.h,
+            },
+            edit_fg,
+        );
+        draw_text(target, "E", &formats.viewer_key, badge_rect, badge_fg);
+
+        // --- "?" shortcuts button ---
+        let hr = layout.help;
+        let help_hovered = hovered == Some(ViewerButton::Help);
+        let help_rect = D2D_RECT_F {
+            left: hr.x,
+            top: hr.y,
+            right: hr.x + hr.w,
+            bottom: hr.y + hr.h,
+        };
+        if help_hovered {
+            let help_rr = D2D1_ROUNDED_RECT {
+                rect: help_rect,
+                radiusX: 6.0 * s,
+                radiusY: 6.0 * s,
+            };
+            // SAFETY: Valid D2D render target and brushes.
+            unsafe {
+                target.FillRoundedRectangle(&help_rr, &brushes.surface_2);
+                target.DrawRoundedRectangle(&help_rr, &brushes.key_border, 1.0 * s, None);
+            }
+        }
+        let help_fg = if help_hovered {
+            &brushes.text_primary
+        } else {
+            &brushes.text_muted
+        };
+        draw_text(target, "?", &formats.viewer_help, help_rect, help_fg);
     }
 }
 

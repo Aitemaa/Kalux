@@ -10,8 +10,9 @@ use std::path::Path;
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use kalux_core::action::help_rows;
-use kalux_core::{Palette, Rgba};
+use kalux_core::{Palette, Rgba, ViewerBarLayout, ViewerButton};
 
+use crate::linux::edit_ui::draw_aa_segment;
 use crate::linux::render::Canvas;
 
 #[derive(Clone, Debug)]
@@ -28,6 +29,8 @@ pub struct OverlayView<'a> {
     pub loading_label: Option<&'a str>,
     pub toast: Option<&'a str>,
     pub show_help: bool,
+    pub show_viewer_bar: bool,
+    pub hovered_viewer_button: Option<ViewerButton>,
 }
 
 impl OverlayView<'_> {
@@ -37,6 +40,7 @@ impl OverlayView<'_> {
             && self.loading_label.is_none()
             && self.toast.is_none()
             && !self.show_help
+            && !self.show_viewer_bar
     }
 }
 
@@ -150,6 +154,9 @@ impl LinuxOverlay {
         }
         if let Some(toast) = view.toast {
             self.draw_pill(canvas, s, palette, toast, true, false);
+        }
+        if view.show_viewer_bar && !view.show_help && view.error.is_none() {
+            self.draw_viewer_bar(canvas, s, palette, view.hovered_viewer_button);
         }
         if view.show_help {
             self.draw_help_sheet(canvas, s, palette);
@@ -537,6 +544,150 @@ impl LinuxOverlay {
                 12.0 * s,
                 palette.muted,
             );
+        }
+    }
+
+    fn draw_viewer_bar(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        s: f32,
+        palette: Palette,
+        hovered: Option<ViewerButton>,
+    ) {
+        let layout = ViewerBarLayout::compute(canvas.width, canvas.height, s);
+        let p = layout.panel;
+        let panel_alpha = if palette.is_dark { 236 } else { 244 };
+
+        // Outer floating pill container.
+        canvas.fill_rounded_rect(
+            p.x,
+            p.y,
+            p.x + p.w,
+            p.y + p.h,
+            10.0 * s,
+            palette.panel.with_alpha(panel_alpha),
+            Some((palette.line_strong, 1.0 * s)),
+        );
+
+        // --- Edit (E) button ---
+        let er = layout.edit;
+        let edit_hovered = hovered == Some(ViewerButton::Edit);
+        let (edit_bg, edit_border, edit_fg, badge_bg, badge_border, badge_fg) = if edit_hovered {
+            (
+                palette.red,
+                None,
+                Rgba::rgb(0xFF, 0xFF, 0xFF),
+                Rgba::rgb(0xFF, 0xFF, 0xFF).with_alpha(48),
+                None,
+                Rgba::rgb(0xFF, 0xFF, 0xFF),
+            )
+        } else {
+            (
+                palette.surface,
+                Some((palette.line, 1.0 * s)),
+                palette.text,
+                palette.panel,
+                Some((palette.line_strong, 1.0 * s)),
+                palette.muted,
+            )
+        };
+        canvas.fill_rounded_rect(
+            er.x,
+            er.y,
+            er.x + er.w,
+            er.y + er.h,
+            6.0 * s,
+            edit_bg,
+            edit_border,
+        );
+
+        // Crisp 45-degree vector pencil icon on the left side of the Edit button.
+        let icx = er.x + 13.5 * s;
+        let icy = er.y + er.h * 0.5;
+        let sw = 1.35 * s;
+        let seg = |canvas: &mut Canvas<'_>, x0: f32, y0: f32, x1: f32, y1: f32| {
+            draw_aa_segment(
+                canvas,
+                icx + x0 * s,
+                icy + y0 * s,
+                icx + x1 * s,
+                icy + y1 * s,
+                sw,
+                edit_fg,
+            );
+        };
+        // Tip + body + eraser cap + collar.
+        seg(canvas, -4.5, 4.5, -4.5, 1.9);
+        seg(canvas, -4.5, 4.5, -1.9, 4.5);
+        seg(canvas, -4.5, 1.9, 1.9, -4.5);
+        seg(canvas, -1.9, 4.5, 4.5, -1.9);
+        seg(canvas, 1.9, -4.5, 4.5, -1.9);
+        seg(canvas, 0.5, -3.1, 3.1, -0.5);
+
+        // Shortcut keycap badge ("E") on the right side of the Edit button.
+        let badge_sz = 18.0 * s;
+        let badge_x = er.x + er.w - badge_sz - 6.0 * s;
+        let badge_y = er.y + (er.h - badge_sz) * 0.5;
+        canvas.fill_rounded_rect(
+            badge_x,
+            badge_y,
+            badge_x + badge_sz,
+            badge_y + badge_sz,
+            4.0 * s,
+            badge_bg,
+            badge_border,
+        );
+
+        let fonts = self.ensure_fonts();
+        if let Some(font) = fonts.sans_bold() {
+            let label_px = 12.0 * s;
+            let scaled = font.as_scaled(PxScale::from(label_px));
+            let th = scaled.ascent() - scaled.descent();
+            let ty = er.y + (er.h - th) * 0.5;
+            render_text_left(canvas, font, "Edit", er.x + 23.5 * s, ty, label_px, edit_fg);
+        }
+        if let Some(font) = fonts.mono() {
+            let key_px = 10.5 * s;
+            let scaled = font.as_scaled(PxScale::from(key_px));
+            let th = scaled.ascent() - scaled.descent();
+            let ty = badge_y + (badge_sz - th) * 0.5;
+            render_text_centered(
+                canvas,
+                font,
+                "E",
+                badge_x + badge_sz * 0.5,
+                ty,
+                key_px,
+                badge_fg,
+            );
+        }
+
+        // --- "?" shortcuts button ---
+        let hr = layout.help;
+        let help_hovered = hovered == Some(ViewerButton::Help);
+        if help_hovered {
+            canvas.fill_rounded_rect(
+                hr.x,
+                hr.y,
+                hr.x + hr.w,
+                hr.y + hr.h,
+                6.0 * s,
+                palette.surface_2,
+                Some((palette.line_strong, 1.0 * s)),
+            );
+        }
+        let help_fg = if help_hovered {
+            palette.text
+        } else {
+            palette.muted
+        };
+        let fonts = self.ensure_fonts();
+        if let Some(font) = fonts.sans_bold() {
+            let q_px = 13.0 * s;
+            let scaled = font.as_scaled(PxScale::from(q_px));
+            let th = scaled.ascent() - scaled.descent();
+            let ty = hr.y + (hr.h - th) * 0.5;
+            render_text_centered(canvas, font, "?", hr.x + hr.w * 0.5, ty, q_px, help_fg);
         }
     }
 }
